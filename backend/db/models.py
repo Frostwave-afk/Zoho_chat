@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, BigInteger, Text
+from sqlalchemy import Column, String, BigInteger, Text, Numeric, Date
 from backend.db.database import Base
 
 
@@ -29,3 +29,18 @@ class ContactCache(Base):
     zoho_contact_id = Column(String(255), nullable=False)
     zoho_email = Column(String(255), nullable=True)
     cached_at = Column(BigInteger, nullable=False)         # Unix timestamp
+
+
+class InvoiceCache(Base):
+    """Zoho invoice snapshot for payment-status queries. Refreshed every 15 min."""
+    __tablename__ = "invoice_cache"
+
+    invoice_id = Column(String(255), primary_key=True)
+    customer_name = Column(String(255), nullable=False)
+    status = Column(String(50), nullable=False)
+    due_date = Column(Date, nullable=True)
+    balance = Column(Numeric(12, 2), nullable=False, default=0)
+    total = Column(Numeric(12, 2), nullable=False, default=0)
+    currency_code = Column(String(10), nullable=False, default="INR")
+    zoho_view_url = Column(Text, nullable=True)
+    last_synced = Column(BigInteger, nullable=False)

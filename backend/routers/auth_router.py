@@ -7,6 +7,7 @@ from backend.db.models import OAuthToken
 from backend.auth.gmail_auth import get_gmail_auth_url, exchange_gmail_code, is_gmail_connected
 from backend.auth.zoho_auth import get_zoho_auth_url, exchange_zoho_code, is_zoho_connected
 from backend.schemas import AuthStatus
+from backend.services.pipeline import clear_session_state
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -44,6 +45,7 @@ async def zoho_callback(code: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/logout")
 async def logout(db: AsyncSession = Depends(get_db)):
-    await db.execute(OAuthToken.__table__.delete())
-    await db.commit()
+    """Fully reset: wipe all tokens, caches, processed email history and
+    in-memory session state so the next login starts completely fresh."""
+    await clear_session_state(db)
     return {"message": "Logged out successfully."}

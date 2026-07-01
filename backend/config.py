@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     ZOHO_REGION: str = "in"
     ZOHO_REDIRECT_URI: str = "http://localhost:8000/auth/zoho/callback"
 
+    # Telegram Bot (optional — only needed when running telegram_bot.py)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ALLOWED_USER_ID: str = ""  # numeric Telegram user ID; empty = allow all (dev mode)
+
     @field_validator("ZOHO_REGION", mode="before")
     @classmethod
     def clean_region(cls, v: str) -> str:

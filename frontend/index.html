@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,8 +9,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
 </head>
+
 <body>
 
   <!-- ── Setup Screen ──────────────────────────────────────────────────── -->
@@ -26,7 +28,9 @@
         <div class="connect-step" id="step-gmail">
           <div class="step-icon gmail-icon">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <path d="M20 4H4C2.9 4 2 4.9 2 6v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z" fill="currentColor"/>
+              <path
+                d="M20 4H4C2.9 4 2 4.9 2 6v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"
+                fill="currentColor" />
             </svg>
           </div>
           <div class="step-info">
@@ -40,8 +44,8 @@
         <div class="connect-step" id="step-zoho">
           <div class="step-icon zoho-icon">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <rect x="2" y="6" width="20" height="14" rx="2" stroke="currentColor" stroke-width="2"/>
-              <path d="M7 10h10M7 14h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <rect x="2" y="6" width="20" height="14" rx="2" stroke="currentColor" stroke-width="2" />
+              <path d="M7 10h10M7 14h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
             </svg>
           </div>
           <div class="step-info">
@@ -84,9 +88,9 @@
       <div class="sidebar-footer">
         <button id="logout-btn" class="logout-btn">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-            <polyline points="16 17 21 12 16 7"/>
-            <line x1="21" y1="12" x2="9" y2="12"/>
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+            <polyline points="16 17 21 12 16 7" />
+            <line x1="21" y1="12" x2="9" y2="12" />
           </svg>
           Logout
         </button>
@@ -118,6 +122,7 @@
                   <li>Create invoices from emails — <em>"Invoice James for the design work"</em></li>
                   <li>Scan recent emails — <em>"Look at emails from today"</em></li>
                   <li>Show drafts for your approval before anything gets created</li>
+                  <li>Check payment status — <em>"Who hasn't paid me?"</em> or <em>"Payment summary"</em></li>
                 </ul>
                 <p>What would you like to do?</p>
               </div>
@@ -129,16 +134,11 @@
 
       <div class="chat-input-area">
         <div class="input-wrapper">
-          <textarea
-            id="chat-input"
-            class="chat-textarea"
-            placeholder="E.g. "Make an invoice for James for the homepage redesign""
-            rows="1"
-          ></textarea>
+          <textarea id="chat-input" class="chat-textarea"></textarea>
           <button id="send-btn" class="send-btn" title="Send">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <line x1="22" y1="2" x2="11" y2="13"/>
-              <polygon points="22 2 15 22 11 13 2 9 22 2" fill="currentColor"/>
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" fill="currentColor" />
             </svg>
           </button>
         </div>
@@ -147,6 +147,7 @@
     </main>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
+
 </html>

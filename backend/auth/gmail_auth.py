@@ -38,7 +38,7 @@ def get_gmail_auth_url() -> tuple[str, str]:
     url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
+        prompt="select_account consent",  # always show account picker + consent
     )
     # Preserve the Flow so the PKCE code_verifier survives the redirect round-trip
     _pending_flows[state] = flow

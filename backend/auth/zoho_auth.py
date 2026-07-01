@@ -30,6 +30,7 @@ def get_zoho_auth_url() -> str:
         "response_type": "code",
         "redirect_uri": settings.ZOHO_REDIRECT_URI,
         "access_type": "offline",
+        "prompt": "consent",          # always show consent → Zoho returns refresh_token
     })
     return f"{settings.zoho_auth_base}/oauth/v2/auth?{params}"
 
@@ -60,7 +61,10 @@ async def exchange_zoho_code(code: str, db: AsyncSession) -> None:
 
     if existing:
         existing.access_token = enc_access
-        existing.refresh_token = enc_refresh
+        # Only overwrite refresh_token when Zoho actually returned one;
+        # re-auth without prompt=consent may omit it.
+        if enc_refresh:
+            existing.refresh_token = enc_refresh
         existing.expires_at = int(time.time()) + expires_in
     else:
         db.add(OAuthToken(

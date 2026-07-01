@@ -371,6 +371,32 @@ html, body {
 .message-bubble ul li { margin-bottom: 4px; }
 .message-bubble em { color: var(--accent); font-style: normal; }
 .message-bubble strong { font-weight: 600; }
+.chat-action-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  margin-left: 4px;
+  border: 1px solid rgba(124,58,237,0.45);
+  border-radius: 7px;
+  background: rgba(124,58,237,0.12);
+  color: #c4b5fd;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+.chat-action-link:hover {
+  background: rgba(124,58,237,0.24);
+  border-color: var(--primary-h);
+  color: #fff;
+}
+.chat-action-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 
 .message-time {
   font-size: 11px;
@@ -397,6 +423,37 @@ html, body {
   0%,60%,100% { transform: translateY(0); opacity: 0.4; }
   30%          { transform: translateY(-6px); opacity: 1; }
 }
+
+/* Live status bubble */
+.status-bubble {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  min-width: 180px;
+}
+.status-spinner {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(139, 92, 246, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.status-bubble-text {
+  font-size: 0.85rem;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  transition: opacity 0.15s ease;
+}
+
 
 /* ─── Draft Card ────────────────────────────────────────────────────────── */
 .draft-card {
@@ -457,6 +514,19 @@ html, body {
   outline: none;
   border-color: var(--primary);
 }
+.draft-field div {
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 14px;
+}
+.draft-inline-help {
+  margin-top: 6px;
+  color: var(--text2);
+  font-size: 12px;
+}
 .draft-field.full-width { grid-column: 1 / -1; }
 
 .draft-missing {
@@ -470,21 +540,38 @@ html, body {
 
 .draft-actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .btn-approve {
   flex: 1;
+  min-width: 140px;
   padding: 11px;
   background: var(--success);
   color: #fff;
   border: none;
   border-radius: var(--radius-sm);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
   transition: opacity var(--transition), transform var(--transition);
 }
 .btn-approve:hover { opacity: 0.88; transform: translateY(-1px); }
+
+.btn-approve-send {
+  flex: 1;
+  min-width: 160px;
+  padding: 11px;
+  background: linear-gradient(135deg, #0891b2, #3b82f6);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity var(--transition), transform var(--transition);
+}
+.btn-approve-send:hover { opacity: 0.88; transform: translateY(-1px); }
 
 .btn-decline {
   padding: 11px 20px;
@@ -497,6 +584,120 @@ html, body {
   transition: background var(--transition), color var(--transition);
 }
 .btn-decline:hover { background: rgba(239,68,68,0.1); color: var(--error); border-color: rgba(239,68,68,0.3); }
+
+/* New contact card variant */
+.new-contact-card {
+  border-color: rgba(6,182,212,0.35);
+  background: rgba(6,182,212,0.03);
+}
+.new-contact-badge {
+  background: rgba(6,182,212,0.12);
+  color: var(--accent);
+  border-color: rgba(6,182,212,0.3);
+}
+.btn-new-contact {
+  background: linear-gradient(135deg, #0891b2, #3b82f6);
+}
+.field-hint {
+  font-size: 10px;
+  color: var(--text3);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* ─── Batch Draft Card ─────────────────────────────────────────────────── */
+.batch-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-top: 14px;
+}
+.batch-header {
+  font-size: 15px;
+  font-weight: 500;
+  margin-bottom: 12px;
+  color: var(--text);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.batch-select-all {
+  font-size: 13px;
+  color: var(--text2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.batch-items {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.batch-item {
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  transition: border-color var(--transition);
+}
+.batch-item:hover { border-color: rgba(255,255,255,0.25); }
+.batch-item input[type="checkbox"] {
+  margin-top: 3px;
+  cursor: pointer;
+}
+.batch-item-content {
+  flex: 1;
+}
+.batch-item-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+.batch-item-desc {
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 6px;
+}
+.batch-item-amount {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--accent);
+  background: rgba(6,182,212,0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.batch-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.batch-actions button {
+  flex: 1;
+  min-width: 130px;
+  padding: 11px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: opacity var(--transition), transform var(--transition);
+}
+.batch-actions button:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+.batch-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-batch-draft { background: var(--surface2); color: var(--text); border: 1px solid var(--border2); }
+.btn-batch-separate { background: var(--primary); color: #fff; }
+.btn-batch-combine-draft { background: linear-gradient(135deg, #7c3aed, #0891b2); color: #fff; }
+.btn-batch-combine { background: linear-gradient(135deg, #0891b2, #3b82f6); color: #fff; }
 
 /* ─── Invoice Created Card ──────────────────────────────────────────────── */
 .invoice-card {
@@ -518,6 +719,13 @@ html, body {
 .invoice-number { font-weight: 700; font-size: 14px; color: var(--success); }
 .invoice-detail { font-size: 13px; color: var(--text2); margin-top: 2px; }
 
+.invoice-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .btn-view-invoice {
   padding: 8px 16px;
   background: transparent;
@@ -531,6 +739,31 @@ html, body {
   transition: background var(--transition);
 }
 .btn-view-invoice:hover { background: rgba(16,185,129,0.1); }
+
+.btn-send-invoice {
+  padding: 8px 16px;
+  background: transparent;
+  border: 1px solid rgba(6,182,212,0.4);
+  color: var(--accent);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), opacity var(--transition);
+}
+.btn-send-invoice:hover    { background: rgba(6,182,212,0.1); }
+.btn-send-invoice:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.invoice-sent-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(6,182,212,0.1);
+  border: 1px solid rgba(6,182,212,0.25);
+  border-radius: 6px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
 
 /* ─── Chat Input ────────────────────────────────────────────────────────── */
 .chat-input-area {
