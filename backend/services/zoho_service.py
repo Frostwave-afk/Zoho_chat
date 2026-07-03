@@ -38,6 +38,12 @@ def _invoice_url(invoice_id: str) -> str:
     return f"{base}/app#/invoices/{invoice_id}"
 
 
+def recurring_invoice_url(recurring_invoice_id: str) -> str:
+    base = _ZOHO_APP_BASE.get(settings.ZOHO_REGION, "https://invoice.zoho.com")
+    return f"{base}/app#/recurringinvoices/{recurring_invoice_id}"
+
+
+
 async def _headers(db: AsyncSession) -> dict:
     token = await get_zoho_access_token(db)
     if not token:
@@ -360,3 +366,264 @@ async def send_invoice_email(
     except Exception as e:
         logger.error(f"Failed to send invoice email for {invoice_id}: {e}")
         return False, str(e)
+
+
+# ── Recurring Invoice API ─────────────────────────────────────────────────────
+
+async def create_recurring_invoice(
+    contact_id: str,
+    item_name: str,
+    amount: float,
+    currency: str,
+    frequency: str,          # "monthly" | "weekly" | "yearly" | "daily"
+    start_date: str,         # "YYYY-MM-DD"
+    db: AsyncSession,
+    task_description: Optional[str] = None,
+    end_date: Optional[str] = None,
+    recurrence_name: Optional[str] = None,
+) -> dict:
+    """
+    Create a Zoho recurring invoice profile.
+    Returns the created recurring_invoice dict from Zoho.
+    """
+    # Zoho accepts: weeks, months, years, days (plural)
+    freq_map = {
+        "monthly": "months", "month": "months", "months": "months",
+        "weekly":  "weeks",  "week":  "weeks",  "weeks":  "weeks",
+        "yearly":  "years",  "year":  "years",  "yearly": "years", "annual": "years", "years": "years",
+        "daily":   "days",   "day":   "days",   "days":   "days",
+    }
+    zoho_freq = freq_map.get(frequency.lower(), "months")
+
+    name = recurrence_name or f"{item_name} — {zoho_freq.capitalize()} Invoice"
+
+    payload: dict = {
+        "customer_id":          contact_id,
+        "recurrence_name":      name,
+        "recurrence_frequency": zoho_freq,
+        "repeat_every":         1,
+        "start_date":           start_date,
+        "line_items": [{
+            "name":        item_name,
+            "description": task_description or item_name,
+            "rate":        amount,
+            "quantity":    1,
+        }],
+    }
+    if end_date:
+        payload["end_date"] = end_date
+
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.zoho_api_base}/recurringinvoices",
+            headers=await _headers(db),
+            params={"organization_id": await get_org_id(db)},
+            json=payload,
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"Recurring invoice creation failed: {resp.text}")
+            raise
+        data = resp.json().get("recurring_invoice", {})
+        data["recurring_invoice_url"] = recurring_invoice_url(data.get("recurring_invoice_id", ""))
+        logger.info(f"Recurring invoice created: {data.get('recurring_invoice_id')} — {name}")
+        return data
+
+
+async def list_recurring_invoices(db: AsyncSession) -> list[dict]:
+    """
+    Fetch all active recurring invoice profiles from Zoho.
+    Returns a list of raw recurring invoice dicts.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{settings.zoho_api_base}/recurringinvoices",
+            headers=await _headers(db),
+            params={
+                "organization_id": await get_org_id(db),
+                "filter_by": "Status.Active",
+                "per_page": 200,
+            },
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"List recurring invoices failed: {resp.text}")
+            raise
+        invoices = resp.json().get("recurring_invoices", [])
+        for inv in invoices:
+            inv["recurring_invoice_url"] = recurring_invoice_url(inv.get("recurring_invoice_id", ""))
+        logger.info(f"Fetched {len(invoices)} active recurring invoice(s)")
+        return invoices
+
+
+
+async def stop_recurring_invoice(recurring_invoice_id: str, db: AsyncSession) -> bool:
+    """
+    Stop (pause) a Zoho recurring invoice profile.
+    Returns True on success, False on failure.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.zoho_api_base}/recurringinvoices/{recurring_invoice_id}/status/stop",
+            headers=await _headers(db),
+            params={"organization_id": await get_org_id(db)},
+        )
+        if resp.is_success:
+            logger.info(f"Recurring invoice {recurring_invoice_id} stopped.")
+            return True
+        logger.error(f"Stop recurring invoice failed: {resp.status_code} — {resp.text[:200]}")
+        return False
+
+
+async def list_all_invoices(db: AsyncSession, status_filter: str | None = None) -> list[dict]:
+    """
+    Fetch all invoices from Zoho (sent, paid, overdue, draft).
+    Optionally filter by status: 'sent', 'paid', 'overdue', 'draft', 'void'.
+    Returns a list of invoice dicts with url attached.
+    Note: sort_column is omitted — Zoho India rejects 'invoice_date' as a sort value.
+    """
+    params: dict = {
+        "organization_id": await get_org_id(db),
+        "per_page": 200,
+    }
+    if status_filter and status_filter != "all":
+        status_map = {
+            "sent":    "Status.Sent",
+            "paid":    "Status.Paid",
+            "draft":   "Status.Draft",
+            "void":    "Status.Void",
+            # Note: Status.Overdue returns 400 on Zoho India — handle client-side below
+        }
+        zoho_filter = status_map.get(status_filter.lower())
+        if zoho_filter:
+            params["filter_by"] = zoho_filter
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{settings.zoho_api_base}/invoices",
+            headers=await _headers(db),
+            params=params,
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"list_all_invoices failed: {resp.text[:300]}")
+            raise
+
+    from datetime import date as _date
+    today_str = _date.today().isoformat()
+
+    invoices = resp.json().get("invoices", [])
+    base = _ZOHO_APP_BASE.get(settings.ZOHO_REGION, "https://invoice.zoho.com")
+    for inv in invoices:
+        inv["invoice_url"] = f"{base}/app#/invoices/{inv.get('invoice_id', '')}"
+        # Compute overdue client-side if Zoho status says 'sent' but due date has passed
+        if inv.get("status", "").lower() == "sent":
+            due = inv.get("due_date") or ""
+            if due and due < today_str:
+                inv["status"] = "overdue"
+
+    # If caller asked for overdue, filter it here (since Zoho India rejects Status.Overdue)
+    if status_filter and status_filter.lower() == "overdue":
+        invoices = [inv for inv in invoices if inv.get("status", "").lower() == "overdue"]
+
+    logger.info(f"Fetched {len(invoices)} invoice(s) (filter={status_filter})")
+    return invoices
+
+
+async def get_invoice_stats(db: AsyncSession) -> dict:
+    """
+    Compute invoice statistics from Zoho.
+    Note: Zoho India rejects Status.Overdue filter — overdue is detected client-side
+    by checking due_date < today on sent invoices.
+    """
+    from datetime import date
+    org_id = await get_org_id(db)
+    headers = await _headers(db)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Fetch all unpaid (sent) invoices — includes overdue ones on Zoho India
+        r_sent = await client.get(
+            f"{settings.zoho_api_base}/invoices",
+            headers=headers,
+            params={"organization_id": org_id, "filter_by": "Status.Sent", "per_page": 200},
+        )
+        # Fetch paid invoices — for revenue history and this-month totals
+        r_paid = await client.get(
+            f"{settings.zoho_api_base}/invoices",
+            headers=headers,
+            params={"organization_id": org_id, "filter_by": "Status.Paid", "per_page": 200},
+        )
+        # Fetch active recurring profiles
+        r_recurring = await client.get(
+            f"{settings.zoho_api_base}/recurringinvoices",
+            headers=headers,
+            params={"organization_id": org_id, "filter_by": "Status.Active", "per_page": 200},
+        )
+
+    sent_raw  = r_sent.json().get("invoices", []) if r_sent.is_success else []
+    paid_list = r_paid.json().get("invoices", []) if r_paid.is_success else []
+    recurring = r_recurring.json().get("recurring_invoices", []) if r_recurring.is_success else []
+
+    today = date.today()
+    today_str = today.isoformat()
+    this_month_prefix = today.strftime("%Y-%m")
+
+    # Split sent_raw into overdue (due_date passed) vs current sent
+    overdue_list = [inv for inv in sent_raw if (inv.get("due_date") or "9999") < today_str]
+    sent_list    = [inv for inv in sent_raw if (inv.get("due_date") or "9999") >= today_str]
+
+    overdue_amount = sum(float(inv.get("balance", 0)) for inv in overdue_list)
+    sent_amount    = sum(float(inv.get("balance", 0)) for inv in sent_list)
+    outstanding    = overdue_amount + sent_amount
+
+    collected_this_month = sum(
+        float(inv.get("total", 0))
+        for inv in paid_list
+        if (inv.get("last_payment_date") or inv.get("invoice_date") or "").startswith(this_month_prefix)
+    )
+
+    paid_count_this_month = sum(
+        1 for inv in paid_list
+        if (inv.get("last_payment_date") or inv.get("invoice_date") or "").startswith(this_month_prefix)
+    )
+
+    # Build 6-month revenue history from paid invoices
+    from collections import defaultdict
+    monthly = defaultdict(float)
+    for inv in paid_list:
+        dt = inv.get("last_payment_date") or inv.get("invoice_date") or ""
+        if len(dt) >= 7:
+            monthly[dt[:7]] += float(inv.get("total", 0))
+
+    # Build sorted last 6 months
+    import calendar
+    revenue_history = []
+    for i in range(5, -1, -1):
+        month_num = (today.month - i - 1) % 12 + 1
+        year_offset = (today.month - i - 1) // 12
+        yr = today.year - year_offset
+        key = f"{yr}-{month_num:02d}"
+        label = f"{calendar.month_abbr[month_num]} {yr}"
+        revenue_history.append({"month": label, "amount": round(monthly.get(key, 0), 2)})
+
+    logger.info(
+        f"Stats: outstanding={outstanding:.2f}, overdue={len(overdue_list)}, "
+        f"sent={len(sent_list)}, paid_all={len(paid_list)}, recurring={len(recurring)}"
+    )
+
+    return {
+        "outstanding_amount":     round(outstanding, 2),
+        "collected_this_month":   round(collected_this_month, 2),
+        "overdue_count":          len(overdue_list),
+        "overdue_amount":         round(overdue_amount, 2),
+        "sent_count":             len(sent_list),
+        "paid_count_this_month":  paid_count_this_month,
+        "paid_total_count":       len(paid_list),
+        "recurring_count":        len(recurring),
+        "revenue_history":        revenue_history,
+    }
+

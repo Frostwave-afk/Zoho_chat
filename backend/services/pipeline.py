@@ -13,8 +13,9 @@ from backend.schemas import (
     ChatResponse, DraftInvoice, CreatedInvoice, PaymentInvoice,
     AmbiguousContact, InvoiceData, ApproveRequest, BatchDraft, BatchDraftItem,
     ManualInvoiceConversation, ManualInvoiceDraft, ManualInvoiceLineItem,
+    RecurringConversation, RecurringInvoiceInfo,
 )
-from backend.services.groq_service import parse_intent, extract_manual_invoice_request
+from backend.services.groq_service import parse_intent, extract_manual_invoice_request, extract_recurring_details
 from backend.services.gemini_service import extract_invoice_data
 from backend.services.gmail_service import search_gmail
 from backend.services.zoho_payments import (
@@ -28,16 +29,50 @@ from backend.services.zoho_service import (
     search_contact_by_name, search_contact_by_email, create_contact, create_invoice,
     mark_email_processed, send_invoice_email, update_contact_email,
     clear_org_id_cache,
+    create_recurring_invoice, list_recurring_invoices, stop_recurring_invoice,
 )
 from backend.db.models import OAuthToken, ProcessedEmail, ContactCache, InvoiceCache
 
 logger = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+
+def parse_relative_date(val: str) -> Optional[str]:
+    """Parse relative date expressions (today, tomorrow, next week, next month) into YYYY-MM-DD."""
+    from datetime import date as _date, timedelta as _timedelta
+    val = val.lower().strip()
+    today = _date.today()
+    if "today" in val:
+        return today.isoformat()
+    if "tomorrow" in val or "tommorow" in val:
+        return (today + _timedelta(days=1)).isoformat()
+    if "next week" in val:
+        return (today + _timedelta(days=7)).isoformat()
+    if "next month" in val:
+        return (today + _timedelta(days=30)).isoformat()
+        
+    m_days = re.search(r"in\s+(\d+)\s+days?", val)
+    if m_days:
+        return (today + _timedelta(days=int(m_days.group(1)))).isoformat()
+        
+    m_weeks = re.search(r"in\s+(\d+)\s+weeks?", val)
+    if m_weeks:
+        return (today + _timedelta(weeks=int(m_weeks.group(1)))).isoformat()
+        
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+        return val
+    return None
+
 _DONE_WORK_RE = re.compile(
     r"work on\s+(?:the\s+)?(?P<project>.+?)\s+is done",
     re.IGNORECASE | re.DOTALL,
 )
+
+# ── In-memory recurring conversation store ────────────────────────────────────
+# key = telegram user_id (int) or "web" for the web frontend
+_pending_recurring_conv: dict[str | int, RecurringConversation] = {}
+# Stores last fetched active recurring list per user for stop-by-number
+_pending_recurring_list: dict[str | int, list[dict]] = {}
 _GENERIC_PLACEHOLDER_VALUES = {
     "john doe",
     "jane doe",
@@ -286,14 +321,19 @@ async def _handle_manual_invoice_conversation(
         parsed = await extract_manual_invoice_request(text)
         if not _message_supports_manual_invoice_payload(text, parsed):
             parsed = {
-                "client_name": None,
-                "client_email": None,
                 "currency": None,
                 "send_email": None,
                 "items": [],
             }
-        proposed_name = parsed.get("client_name") or text
-        proposed_email = parsed.get("client_email")
+        
+        # When waiting for a customer name, the text itself is the proposed name.
+        # We also attempt to extract an email if the user provided one in the same message.
+        proposed_name = text
+        proposed_email = None
+        email_match = _EMAIL_RE.search(text)
+        if email_match:
+            proposed_email = email_match.group()
+            proposed_name = text.replace(proposed_email, "").strip()
         name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
             proposed_name,
             proposed_email,
@@ -333,24 +373,36 @@ async def _handle_manual_invoice_conversation(
                 manual_invoice_draft=draft,
             )
 
-        state.step = "awaiting_item_count"
+        state.step = "awaiting_service_name"
         return ChatResponse(
-            reply=f"Got it — this invoice is for **{state.client_name}**. How many line items should I add?",
+            reply=f"📦 What service or work should I invoice **{state.client_name}** for?",
             action="clarification_needed",
         )
 
     if state.step == "awaiting_customer_email":
-        email = text if _EMAIL_RE.fullmatch(text) else None
-        if not email:
-            return ChatResponse(
-                reply="Please send a valid customer email address so I can create the new Zoho contact.",
-                action="clarification_needed",
-            )
+        if text.lower().strip() in ("skip", "none", "no email"):
+            email = None
+        else:
+            email = text if _EMAIL_RE.fullmatch(text) else None
+            if not email:
+                return ChatResponse(
+                    reply="Please send a valid email address, or type **skip** to continue without one.",
+                    action="clarification_needed",
+                )
         state.client_email = email
         state.is_new_contact = True
-        state.step = "awaiting_item_count"
+        state.step = "awaiting_service_name"
         return ChatResponse(
-            reply=f"Perfect — I'll create **{state.client_name}** as a new customer. How many line items should I add?",
+            reply=f"📦 What service or work should I invoice **{state.client_name}** for?",
+            action="clarification_needed",
+        )
+
+    # ── NEW: clean service → amount → confirm flow ─────────────────────────
+    if state.step == "awaiting_service_name":
+        state.pending_item_name = text
+        state.step = "awaiting_item_amount"
+        return ChatResponse(
+            reply=f"💰 What's the amount? (e.g. **₹5,000** or **$500**)",
             action="clarification_needed",
         )
 
@@ -424,32 +476,34 @@ async def _handle_manual_invoice_conversation(
             )
         if currency:
             state.currency = currency
+
+        # Auto-format the item name: title-case it properly
+        raw_name = (state.pending_item_name or "Service").strip()
+        item_name = raw_name.title()
+
+        # Generate a clean description if none was set
+        description = (state.pending_item_description or "").strip()
+        if not description:
+            # e.g. "website redesign" → "Website Redesign Services"
+            description = item_name if item_name.endswith("s") else f"{item_name} Services"
+
         state.line_items.append(
             ManualInvoiceLineItem(
-                item_name=state.pending_item_name or "Item",
-                task_description=state.pending_item_description or (state.pending_item_name or "Item"),
+                item_name=item_name,
+                task_description=description,
                 amount=amount,
             )
         )
         state.pending_item_name = None
         state.pending_item_description = None
 
+        # If more items needed (old multi-item flow), continue collecting
         if len(state.line_items) < state.item_count:
             next_idx = len(state.line_items) + 1
             state.step = "awaiting_item_name"
             return ChatResponse(reply=f"What's the name of item {next_idx}?", action="clarification_needed")
 
-        state.step = "awaiting_send_choice"
-        return ChatResponse(
-            reply="All set. Should I send the invoice email after creating it? Reply with `yes` or `no`.",
-            action="clarification_needed",
-        )
-
-    if state.step == "awaiting_send_choice":
-        send_email = _parse_yes_no(text)
-        if send_email is None:
-            return ChatResponse(reply="Please reply with `yes` or `no`.", action="clarification_needed")
-        state.send_email = send_email
+        # All items collected — show draft card immediately (no yes/no needed)
         draft = _build_manual_invoice_draft_from_state(state)
         _manual_invoice_conversation = None
         return ChatResponse(
@@ -457,6 +511,8 @@ async def _handle_manual_invoice_conversation(
             action="manual_invoice_pending",
             manual_invoice_draft=draft,
         )
+
+    # awaiting_send_choice is removed — drafts go straight to card now
 
     return None
 
@@ -579,10 +635,453 @@ _DATE_LABELS: dict[str, str] = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Recurring invoice handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _recurring_confirm_text(conv: RecurringConversation) -> str:
+    """Build the confirm-card summary for a recurring invoice draft."""
+    from datetime import date as _date
+    start = conv.start_date or "today"
+    if start == "today":
+        start = _date.today().isoformat()
+    freq_emoji = {"monthly": "📅", "weekly": "📅", "yearly": "📅", "daily": "📅"}.get(conv.frequency or "monthly", "📅")
+    lines = [
+        "📋 **Recurring Invoice Draft**",
+        "",
+        f"👤 **Client:**  {conv.client_name or '—'}",
+    ]
+    if conv.client_email:
+        lines.append(f"📧 **Email:**   {conv.client_email}")
+    lines += [
+        f"💰 **Amount:**  {conv.currency} {conv.amount:,.2f} / {conv.frequency or 'month'}",
+        f"{freq_emoji} **Frequency:** {(conv.frequency or 'monthly').capitalize()}",
+        f"📆 **Starts:**  {start}",
+        f"🏁 **Ends:**    {conv.end_date or 'No end date'}",
+    ]
+    if conv.item_name:
+        lines.append(f"📦 **Service:**  {conv.item_name}")
+    return "\n".join(lines)
+
+
+async def _handle_recurring_create(
+    message: str,
+    db: AsyncSession,
+    emit,
+    session_key: str | int,
+) -> ChatResponse:
+    """
+    Multi-step conversation to create a recurring invoice.
+    Also handles one-shot creation when all fields are in the first message.
+    """
+    from datetime import date as _date
+    conv = _pending_recurring_conv.get(session_key)
+
+    if conv:
+        step = conv.step
+        msg = message.strip()
+
+        # Check if the user wants to cancel mid-conversation
+        if msg.lower() in ("cancel", "discard", "stop", "abort"):
+            _pending_recurring_conv.pop(session_key, None)
+            return ChatResponse(
+                reply="Recurring invoice draft cancelled. ✗",
+                action="clarification_needed",
+            )
+
+        if step == "client":
+            raw_client = msg
+            email_match = _EMAIL_RE.search(raw_client)
+            proposed_email = None
+            proposed_name = raw_client
+            if email_match:
+                proposed_email = email_match.group(0)
+                proposed_name = raw_client.replace(proposed_email, "").strip() or proposed_email.split("@")[0]
+
+            name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
+                proposed_name,
+                proposed_email,
+                db,
+            )
+
+            conv = conv.model_copy(update={
+                "client_name": name or proposed_name,
+                "client_email": email,
+                "zoho_contact_id": contact_id,
+                "is_new_contact": is_new,
+            })
+
+            if clarification:
+                if is_new and not email:
+                    conv = conv.model_copy(update={"step": "awaiting_customer_email"})
+                _pending_recurring_conv[session_key] = conv
+                return ChatResponse(reply=clarification, action="clarification_needed")
+
+            # Contact resolved/confirmed -> move to item_name
+            conv = conv.model_copy(update={"step": "item_name"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)",
+                action="clarification_needed",
+            )
+
+        if step == "awaiting_customer_email":
+            email_match = _EMAIL_RE.search(msg)
+            if not email_match and msg.lower().strip() != "skip":
+                return ChatResponse(
+                    reply="Please enter a valid email address, or say **skip** to proceed without an email.",
+                    action="clarification_needed",
+                )
+            email = email_match.group(0) if email_match else None
+            conv = conv.model_copy(update={
+                "client_email": email,
+                "step": "item_name",
+            })
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)",
+                action="clarification_needed",
+            )
+
+        if step == "item_name":
+            conv = conv.model_copy(update={"item_name": msg, "step": "amount"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply=f"Got it — for **{conv.item_name}**. 💰 What's the amount and currency? (e.g. ₹15,000 or $500)",
+                action="clarification_needed",
+            )
+
+        if step == "amount":
+            # Parse amount + currency from raw text
+            nums = re.findall(r"[\d,]+(?:\.\d+)?", msg.replace(",", ""))
+            currency = "INR" if any(c in msg for c in ("₹", "rs", "inr")) else (
+                "USD" if "$" in msg else conv.currency
+            )
+            if nums:
+                amount = float(nums[0].replace(",", ""))
+                conv = conv.model_copy(update={"amount": amount, "currency": currency, "step": "frequency"})
+                _pending_recurring_conv[session_key] = conv
+                return ChatResponse(
+                    reply="🔁 How often should the invoice repeat?\n**monthly / weekly / yearly / daily**",
+                    action="clarification_needed",
+                )
+            return ChatResponse(reply="I didn't catch the amount. Please enter a number (e.g. ₹15000 or 500).", action="clarification_needed")
+
+        if step == "frequency":
+            freq_map = {"monthly": "monthly", "month": "monthly", "weekly": "weekly", "week": "weekly",
+                        "yearly": "yearly", "year": "yearly", "annual": "yearly", "daily": "daily", "day": "daily"}
+            freq = freq_map.get(msg.lower().strip())
+            if not freq:
+                return ChatResponse(reply="Please choose: **monthly**, **weekly**, **yearly**, or **daily**.", action="clarification_needed")
+            conv = conv.model_copy(update={"frequency": freq, "step": "start_date"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply="📆 When should it start? (e.g. **today**, **2025-07-01**)",
+                action="clarification_needed",
+            )
+
+        if step == "start_date":
+            start = parse_relative_date(msg)
+            if not start:
+                return ChatResponse(
+                    reply="I couldn't parse that date. Please enter a date in **YYYY-MM-DD** format, or say **today**, **tomorrow**, **next week**, or **next month**.",
+                    action="clarification_needed"
+                )
+            conv = conv.model_copy(update={"start_date": start})
+
+            # ── Contact check before showing confirm card ──
+            if not conv.zoho_contact_id and not conv.client_email:
+                # Quick lookup — if not found, ask for email
+                name, email, contact_id, is_new, _clarification = await _resolve_manual_customer(
+                    conv.client_name,
+                    conv.client_email,
+                    db,
+                )
+                conv = conv.model_copy(update={
+                    "client_name": name or conv.client_name,
+                    "client_email": email,
+                    "zoho_contact_id": contact_id,
+                    "is_new_contact": is_new,
+                })
+                if is_new and not email:
+                    conv = conv.model_copy(update={"step": "confirm_email"})
+                    _pending_recurring_conv[session_key] = conv
+                    return ChatResponse(
+                        reply=f"📧 **{conv.client_name}** isn't in your Zoho contacts yet. What's their email address so I can create them?\n\n_(Reply **skip** to proceed without an email)_",
+                        action="clarification_needed",
+                    )
+
+            conv = conv.model_copy(update={"step": "confirm"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
+                action="recurring_pending",
+                recurring_draft=conv,
+            )
+
+        if step == "confirm_email":
+            email_match = _EMAIL_RE.search(msg)
+            if not email_match and msg.lower().strip() != "skip":
+                return ChatResponse(
+                    reply="Please enter a valid email address, or say **skip** to proceed without an email.",
+                    action="clarification_needed",
+                )
+            email = email_match.group(0) if email_match else None
+            conv = conv.model_copy(update={"client_email": email, "step": "confirm"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(
+                reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
+                action="recurring_pending",
+                recurring_draft=conv,
+            )
+
+        if step == "confirm":
+            if any(w in msg.lower() for w in ("confirm", "yes", "create", "go", "ok", "do it", "proceed")):
+                return await _execute_recurring_create(conv, db, emit, session_key)
+            _pending_recurring_conv.pop(session_key, None)
+            return ChatResponse(reply="Recurring invoice cancelled. ✗", action="clarification_needed")
+
+
+    # ── No active conversation — try to extract from message ──────────────────
+    await emit("🧠 Extracting recurring invoice details…")
+    extracted = await extract_recurring_details(message)
+
+    start_raw = extracted.get("start_date")
+    if start_raw:
+        parsed_start = parse_relative_date(start_raw)
+        if parsed_start:
+            start_raw = parsed_start
+        else:
+            start_raw = None
+
+
+    conv = RecurringConversation(
+        step="confirm" if all([
+            extracted.get("client_name"),
+            extracted.get("item_name"),
+            extracted.get("amount"),
+            extracted.get("frequency"),
+            start_raw,
+        ]) else "client",
+        client_name=extracted.get("client_name"),
+        client_email=extracted.get("client_email"),
+        item_name=extracted.get("item_name"),
+        task_description=extracted.get("task_description"),
+        amount=extracted.get("amount"),
+        currency=extracted.get("currency") or "INR",
+        frequency=extracted.get("frequency"),
+        start_date=start_raw,
+        end_date=extracted.get("end_date"),
+    )
+    _pending_recurring_conv[session_key] = conv
+
+    # All fields present → check if contact resolves
+    if conv.step == "confirm":
+        name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
+            conv.client_name,
+            conv.client_email,
+            db,
+        )
+        conv = conv.model_copy(update={
+            "client_name": name or conv.client_name,
+            "client_email": email or conv.client_email,
+            "zoho_contact_id": contact_id,
+            "is_new_contact": is_new,
+        })
+        if clarification:
+            if is_new and not email:
+                conv = conv.model_copy(update={"step": "awaiting_customer_email"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(reply=clarification, action="clarification_needed")
+
+        # Contact is good -> go straight to confirm card
+        return ChatResponse(
+            reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
+            action="recurring_pending",
+            recurring_draft=conv,
+        )
+
+    # Missing fields → do contact lookup first, then start conversation
+    if conv.client_name and not conv.zoho_contact_id:
+        name, email, contact_id, is_new, _cl = await _resolve_manual_customer(
+            conv.client_name,
+            conv.client_email,
+            db,
+        )
+        conv = conv.model_copy(update={
+            "client_name": name or conv.client_name,
+            "client_email": email or conv.client_email,
+            "zoho_contact_id": contact_id,
+            "is_new_contact": is_new,
+        })
+        _pending_recurring_conv[session_key] = conv
+
+    if not conv.client_name:
+        conv = conv.model_copy(update={"step": "client"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(reply="Sure! Let's set up a recurring invoice.\n\n👤 Who is the client? (name or email)", action="clarification_needed")
+    if not conv.item_name:
+        conv = conv.model_copy(update={"step": "item_name"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)", action="clarification_needed")
+    if conv.amount is None:
+        conv = conv.model_copy(update={"step": "amount"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(reply=f"Got it — for **{conv.item_name or conv.client_name}**. 💰 What's the amount and currency?", action="clarification_needed")
+    if not conv.frequency:
+        conv = conv.model_copy(update={"step": "frequency"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(reply="🔁 How often? (**monthly / weekly / yearly / daily**)", action="clarification_needed")
+    conv = conv.model_copy(update={"step": "start_date"})
+    _pending_recurring_conv[session_key] = conv
+    return ChatResponse(reply="📆 When should it start? (e.g. **today**, **2025-07-01**)", action="clarification_needed")
+
+
+
+async def _execute_recurring_create(
+    conv: RecurringConversation,
+    db: AsyncSession,
+    emit,
+    session_key: str | int,
+) -> ChatResponse:
+    """Create the recurring invoice in Zoho and clear conversation state."""
+    from datetime import date as _date
+    _pending_recurring_conv.pop(session_key, None)
+
+    await emit("📡 Looking up client in Zoho…")
+    contact_id = conv.zoho_contact_id
+    if not contact_id and conv.client_name:
+        try:
+            matches = await search_contact_by_name(conv.client_name, db)
+            if matches:
+                contact_id = matches[0]["contact_id"]
+                if not conv.client_email:
+                    conv = conv.model_copy(update={"client_email": matches[0].get("email")})
+        except Exception:
+            pass
+    if not contact_id:
+        try:
+            contact_id = await create_contact(conv.client_name or "Unknown", conv.client_email, db)
+        except Exception as e:
+            return ChatResponse(reply=f"⚠️ Couldn't create/find Zoho contact: {e}", action="error")
+
+    start = conv.start_date or _date.today().isoformat()
+    item  = conv.item_name or conv.task_description or f"{conv.frequency or 'Monthly'} Service"
+
+    await emit("📡 Creating recurring invoice in Zoho…")
+    try:
+        result = await create_recurring_invoice(
+            contact_id=contact_id,
+            item_name=item,
+            amount=conv.amount or 0,
+            currency=conv.currency,
+            frequency=conv.frequency or "monthly",
+            start_date=start,
+            db=db,
+            task_description=conv.task_description,
+            end_date=conv.end_date,
+        )
+    except Exception as e:
+        return ChatResponse(reply=f"⚠️ Failed to create recurring invoice: {e}", action="error")
+
+    rec_id  = result.get("recurring_invoice_id", "")
+    rec_name = result.get("recurrence_name", item)
+    rec_url = result.get("recurring_invoice_url", "")
+    return ChatResponse(
+        reply=(
+            f"✅ **Recurring invoice created!**\n\n"
+            f"📋 **{rec_name}**\n"
+            f"👤 {conv.client_name}  |  {conv.currency} {conv.amount:,.2f} / {conv.frequency}\n"
+            f"📆 Starts: {start}"
+            + (f"\n🏁 Ends: {conv.end_date}" if conv.end_date else "")
+            + f"\n\n🔗 **[View Recurring Profile in Zoho]({rec_url})**"
+        ),
+        action="recurring_created",
+    )
+
+
+async def _handle_recurring_list(
+    db: AsyncSession,
+    emit,
+    session_key: str | int,
+) -> ChatResponse:
+    """Fetch and display all active recurring invoices."""
+    await emit("📡 Fetching active recurring invoices…")
+    try:
+        invoices = await list_recurring_invoices(db)
+    except Exception as e:
+        return ChatResponse(reply=f"⚠️ Couldn't fetch recurring invoices: {e}", action="error")
+
+    if not invoices:
+        _pending_recurring_list.pop(session_key, None)
+        return ChatResponse(reply="You have no active recurring invoices.", action="recurring_list")
+
+    _pending_recurring_list[session_key] = invoices
+
+    lines = ["🔁 **Active Recurring Invoices**\n"]
+    for i, inv in enumerate(invoices, 1):
+        amount   = inv.get("total", inv.get("amount", 0))
+        freq     = inv.get("recurrence_frequency", "monthly")
+        customer = inv.get("customer_name", "Unknown")
+        name     = inv.get("recurrence_name", customer)
+        start    = inv.get("start_date", "")
+        url      = inv.get("recurring_invoice_url", "")
+        lines.append(
+            f"**{i}.** [{name}]({url})\n"
+            f"   👤 {customer}  💰 {inv.get('currency_code','INR')} {amount:,.2f} / {freq}"
+            + (f"\n   📆 Since {start}" if start else "")
+        )
+    lines.append("\nTap **⏹ Stop** on a row, or reply with numbers to stop (e.g. **1 2**).")
+
+    return ChatResponse(reply="\n".join(lines), action="recurring_list")
+
+
+async def _handle_recurring_stop(
+    message: str,
+    db: AsyncSession,
+    emit,
+    session_key: str | int,
+) -> ChatResponse:
+    """Stop one or more recurring invoices by number or show the list first."""
+    # Check if user gave numbers (e.g. "1 2" or "stop 1") referring to cached list
+    cached = _pending_recurring_list.get(session_key)
+    numbers = [int(t) for t in re.findall(r"\b(\d+)\b", message) if int(t) >= 1]
+
+    if cached and numbers:
+        stopped, failed = [], []
+        for n in numbers:
+            if 1 <= n <= len(cached):
+                inv = cached[n - 1]
+                rid = inv.get("recurring_invoice_id")
+                name = inv.get("recurrence_name") or inv.get("customer_name", str(n))
+                await emit(f"⏹ Stopping {name}…")
+                ok = await stop_recurring_invoice(rid, db)
+                (stopped if ok else failed).append(name)
+
+        parts = []
+        if stopped:
+            parts.append(f"✅ Stopped {len(stopped)} recurring invoice(s): {', '.join(stopped)}")
+        if failed:
+            parts.append(f"⚠️ Failed to stop: {', '.join(failed)}")
+        _pending_recurring_list.pop(session_key, None)
+        return ChatResponse(reply="\n".join(parts) or "Nothing changed.", action="recurring_stopped")
+
+    # No cached list or no numbers — show the list first
+    list_resp = await _handle_recurring_list(db, emit, session_key)
+    if list_resp.action != "recurring_list" or not _pending_recurring_list.get(session_key):
+        return list_resp
+    list_resp = list_resp.model_copy(update={
+        "reply": list_resp.reply + "\n\n🛑 Reply with the **number(s)** you want to stop."
+    })
+    return list_resp
+
+
+
 async def process_chat(
     message: str,
     db: AsyncSession,
     status_cb=None,          # optional async callable(str) for SSE status updates
+    session_key: str | int = "web",
 ) -> ChatResponse:
     global _manual_invoice_conversation
     normalized_message = " ".join((message or "").lower().split())
@@ -605,14 +1104,24 @@ async def process_chat(
     if conversation_response:
         return conversation_response
 
+    # ── Check if a recurring invoice conversation is in progress ────────────
+    if session_key in _pending_recurring_conv:
+        return await _handle_recurring_create(message, db, emit, session_key)
+
+    # ── Check if user is replying with numbers to stop recurring invoices ───
+    if session_key in _pending_recurring_list:
+        numbers = [t for t in re.findall(r"\b(\d+)\b", message) if int(t) >= 1]
+        if numbers:
+            return await _handle_recurring_stop(message, db, emit, session_key)
+
     # ── Handle greetings and unclear intents naturally ───────────────────────
     if action == "greeting":
         return ChatResponse(
             reply=(
-                "Hey! 👋 Happy to help. You can ask me things like:\n"
-                "• *\"Invoice Piyusha for yesterday's design work\"*\n"
-                "• *\"Check emails from last Sunday\"*\n"
-                "• *\"Who hasn't paid me?\"* or *\"Payment summary\"*\n\n"
+                "Hey 👋 I am Invoice Agent! Happy to help. You can ask me things like:\n"
+                "• \"Jacks invoice from yesterday's design work\"\n"
+                "• \"Check emails from last Sunday\"\n"
+                "• \"Who hasn't paid me?\" or \"Payment summary\"\n"
                 "What would you like to do?"
             ),
             action="clarification_needed",
@@ -621,87 +1130,82 @@ async def process_chat(
         return ChatResponse(
             reply=(
                 "Hmm, I'm not quite sure what you need. You could try something like:\n"
-                "• *\"Invoice Piyusha for the design work from yesterday\"*\n"
-                "• *\"Look at emails from last Sunday\"*\n"
-                "• *\"Make an invoice for Rahul for the website project\"*"
+                "• \"Invoice Jacks for the design work from yesterday\"\n"
+                "• \"Look at emails from last Sunday\"\n"
+                "• \"Make an invoice for Rahul for the website project\""
             ),
             action="clarification_needed",
         )
 
-    if action == "create_invoice" and (
-        "new invoice" in normalized_message
-        or "manual invoice" in normalized_message
-        or "from scratch" in normalized_message
-        or "without email" in normalized_message
-        or "dont read email" in normalized_message
-        or "don't read email" in normalized_message
-    ):
+    # ── Handle create_invoice: ALWAYS use guided step-by-step flow ────────────
+    # The old email-scan path for create_invoice is removed.
+    # Email scanning only happens via explicit "scan_emails" action.
+    if action == "create_invoice":
         parsed = await extract_manual_invoice_request(message)
-        if parsed.get("is_manual_invoice_request") and _message_supports_manual_invoice_payload(message, parsed):
-            items = [
-                ManualInvoiceLineItem(**item)
-                for item in (parsed.get("items") or [])
-                if item.get("item_name") and item.get("task_description") and item.get("amount") is not None
-            ]
-            client_name = parsed.get("client_name")
-            client_email = parsed.get("client_email")
-            currency = parsed.get("currency") or "USD"
 
-            if client_name:
-                name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
-                    client_name,
-                    client_email,
-                    db,
-                )
-                if clarification and (not items or not email):
-                    _manual_invoice_conversation = ManualInvoiceConversation(
-                        step="awaiting_customer_email" if is_new and not email and name else "awaiting_customer",
-                        client_name=name,
-                        client_email=email,
-                        currency=currency,
-                        zoho_contact_id=contact_id,
-                        is_new_contact=is_new,
-                    )
-                    return ChatResponse(reply=clarification, action="clarification_needed")
+        client_name  = person_name
+        client_email = None
+        currency     = parsed.get("currency") or "INR"
+        items = [
+            ManualInvoiceLineItem(**item)
+            for item in (parsed.get("items") or [])
+            if item.get("item_name") and item.get("task_description") and item.get("amount") is not None
+        ]
 
-                if items:
-                    draft = ManualInvoiceDraft(
-                        draft_id=str(uuid.uuid4()),
-                        client_name=name or client_name,
-                        client_email=email,
-                        currency=currency,
-                        zoho_contact_id=contact_id,
-                        is_new_contact=is_new,
-                        line_items=items,
-                    )
-                    _pending_manual_invoice_drafts[draft.draft_id] = draft
-                    return ChatResponse(
-                        reply=_manual_invoice_summary(draft),
-                        action="manual_invoice_pending",
-                        manual_invoice_draft=draft,
-                    )
-
+        # If we have enough for a full draft (name + items), show confirm card
+        if client_name and items:
+            name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
+                client_name, client_email, db
+            )
+            if clarification and not email:
                 _manual_invoice_conversation = ManualInvoiceConversation(
-                    step="awaiting_item_count",
+                    step="awaiting_customer_email" if is_new and not email else "awaiting_customer",
                     client_name=name or client_name,
                     client_email=email,
                     currency=currency,
                     zoho_contact_id=contact_id,
                     is_new_contact=is_new,
-                    send_email=parsed.get("send_email"),
                 )
-                return ChatResponse(
-                    reply=f"Okay — creating a new invoice for **{name or client_name}**. How many line items should I add?",
-                    action="clarification_needed",
-                )
+                return ChatResponse(reply=clarification, action="clarification_needed")
 
+            draft = ManualInvoiceDraft(
+                draft_id=str(uuid.uuid4()),
+                client_name=name or client_name,
+                client_email=email,
+                currency=currency,
+                zoho_contact_id=contact_id,
+                is_new_contact=is_new,
+                line_items=items,
+            )
+            _pending_manual_invoice_drafts[draft.draft_id] = draft
+            return ChatResponse(
+                reply=_manual_invoice_summary(draft),
+                action="manual_invoice_pending",
+                manual_invoice_draft=draft,
+            )
+
+        # If we have a name but no items — resolve contact then ask for service
+        if client_name:
+            name, email, contact_id, is_new, _cl = await _resolve_manual_customer(
+                client_name, client_email, db
+            )
+            _manual_invoice_conversation = ManualInvoiceConversation(
+                step="awaiting_service_name",
+                client_name=name or client_name,
+                client_email=email,
+                currency=currency,
+                zoho_contact_id=contact_id,
+                is_new_contact=is_new,
+            )
+            return ChatResponse(
+                reply=f"📦 What service or work should I invoice **{name or client_name}** for?",
+                action="clarification_needed",
+            )
+
+        # No name at all — start from scratch
         _manual_invoice_conversation = ManualInvoiceConversation(step="awaiting_customer")
         return ChatResponse(
-            reply=(
-                "Sure — let's create a new invoice.\n\n"
-                "Who is it for? If it's an existing customer, send the name.\n"
-                "If it's a new customer, send the name and email."
-            ),
+            reply="Sure — let's create a new invoice.\n\n👤 Who is it for? (name, or name + email for a new client)",
             action="clarification_needed",
         )
 
@@ -787,6 +1291,16 @@ async def process_chat(
     # ── Payment status queries ───────────────────────────────────────────────
     if action in ("check_overdue", "check_pending", "check_specific_payment", "payment_summary"):
         return await _handle_payment_query(action, person_name, db, emit=emit)
+
+    # ── Recurring invoice intents ────────────────────────────────────────────
+    if action == "list_recurring":
+        return await _handle_recurring_list(db, emit, session_key)
+
+    if action == "stop_recurring":
+        return await _handle_recurring_stop(message, db, emit, session_key)
+
+    if action == "create_recurring":
+        return await _handle_recurring_create(message, db, emit, session_key)
 
     # ── 2. Resolve contact name ─────────────────────────────────────────────
     person_email: Optional[str] = None
@@ -1486,6 +2000,9 @@ async def approve_manual_invoice(
     draft_id: str,
     send_email: bool,
     db: AsyncSession,
+    client_name: str | None = None,
+    client_email: str | None = None,
+    line_items: list | None = None,
 ) -> ChatResponse:
     draft = _pending_manual_invoice_drafts.get(draft_id)
     if not draft:
@@ -1493,6 +2010,21 @@ async def approve_manual_invoice(
             reply="This manual invoice draft has expired or was already processed.",
             action="error",
         )
+
+    # Apply any edits the user made in the confirmation card
+    if client_name:
+        draft.client_name = client_name.strip()
+    if client_email is not None:
+        draft.client_email = client_email.strip() or None
+    if line_items:
+        draft.line_items = [
+            ManualInvoiceLineItem(
+                item_name=li.get("item_name", "Service") if isinstance(li, dict) else li.item_name,
+                task_description=li.get("task_description", "") if isinstance(li, dict) else li.task_description,
+                amount=float(li.get("amount", 0)) if isinstance(li, dict) else float(li.amount),
+            )
+            for li in line_items
+        ]
 
     contact_id = draft.zoho_contact_id
     try:
@@ -1505,7 +2037,7 @@ async def approve_manual_invoice(
             asyncio.create_task(update_contact_email(contact_id, draft.client_email, db))
 
         total_amount = sum(item.amount for item in draft.line_items)
-        line_items = [
+        line_items_payload = [
             {
                 "name": item.item_name,
                 "description": item.task_description,
@@ -1519,9 +2051,9 @@ async def approve_manual_invoice(
             contact_id=contact_id,
             task_description="",
             amount=0.0,
-            currency=draft.currency or "USD",
+            currency=draft.currency or "INR",
             db=db,
-            line_items=line_items,
+            line_items=line_items_payload,
         )
 
         email_sent = False
@@ -1538,7 +2070,7 @@ async def approve_manual_invoice(
             client_name=draft.client_name,
             client_email=draft.client_email,
             amount=total_amount,
-            currency=draft.currency or "USD",
+            currency=draft.currency or "INR",
             invoice_url=invoice.get("invoice_url"),
             email_sent=email_sent,
         )

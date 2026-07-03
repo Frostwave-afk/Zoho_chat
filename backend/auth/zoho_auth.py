@@ -16,6 +16,7 @@ settings = get_settings()
 ZOHO_SCOPES = ",".join([
     "ZohoInvoice.invoices.CREATE",
     "ZohoInvoice.invoices.READ",
+    "ZohoInvoice.invoices.UPDATE",
     "ZohoInvoice.contacts.READ",
     "ZohoInvoice.contacts.CREATE",
     "ZohoInvoice.settings.READ",

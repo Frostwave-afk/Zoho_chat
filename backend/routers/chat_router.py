@@ -95,4 +95,7 @@ async def manual_approve(request: ManualInvoiceApproveRequest, db: AsyncSession 
         draft_id=request.draft_id,
         send_email=request.send_email,
         db=db,
+        client_name=request.client_name,
+        client_email=request.client_email,
+        line_items=request.line_items,
     )

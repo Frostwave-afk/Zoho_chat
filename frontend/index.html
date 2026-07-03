@@ -5,11 +5,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Invoice Agent — Gmail × Zoho</title>
-  <meta name="description" content="AI-powered agent that reads your Gmail and creates Zoho invoices automatically." />
+  <meta name="description" content="AI-powered invoice agent that reads your Gmail and manages Zoho invoices automatically." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=13" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 
 <body>
@@ -28,9 +29,7 @@
         <div class="connect-step" id="step-gmail">
           <div class="step-icon gmail-icon">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M20 4H4C2.9 4 2 4.9 2 6v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"
-                fill="currentColor" />
+              <path d="M20 4H4C2.9 4 2 4.9 2 6v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z" fill="currentColor" />
             </svg>
           </div>
           <div class="step-info">
@@ -72,7 +71,36 @@
       </div>
 
       <nav class="sidebar-nav">
-        <div class="nav-section-label">Accounts</div>
+        <div class="nav-section-label">Navigation</div>
+
+        <button class="nav-item active" id="nav-chat" onclick="showPage('chat')">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+          Chat
+        </button>
+
+        <button class="nav-item" id="nav-invoices" onclick="showPage('invoices')">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14,2 14,8 20,8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <line x1="10" y1="9" x2="8" y2="9"/>
+          </svg>
+          Invoices
+        </button>
+
+        <button class="nav-item" id="nav-analytics" onclick="showPage('analytics')">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <line x1="18" y1="20" x2="18" y2="10"/>
+            <line x1="12" y1="20" x2="12" y2="4"/>
+            <line x1="6" y1="20" x2="6" y2="14"/>
+          </svg>
+          Analytics
+        </button>
+
+        <div class="nav-section-label" style="margin-top:20px">Accounts</div>
         <div class="nav-account" id="nav-gmail">
           <span class="account-dot gmail-dot"></span>
           <span>Gmail</span>
@@ -97,8 +125,8 @@
       </div>
     </aside>
 
-    <!-- Main Chat -->
-    <main class="chat-main">
+    <!-- ── CHAT PAGE ──────────────────────────────────────────────────── -->
+    <main class="page-content" id="page-chat">
       <header class="chat-header">
         <div class="chat-header-info">
           <h2>Chat</h2>
@@ -123,6 +151,7 @@
                   <li>Scan recent emails — <em>"Look at emails from today"</em></li>
                   <li>Show drafts for your approval before anything gets created</li>
                   <li>Check payment status — <em>"Who hasn't paid me?"</em> or <em>"Payment summary"</em></li>
+                  <li>Set up recurring invoices — <em>"Recurring invoice for Sarah"</em></li>
                 </ul>
                 <p>What would you like to do?</p>
               </div>
@@ -145,9 +174,165 @@
         <div class="input-hint">Press <kbd>Enter</kbd> to send · <kbd>Shift+Enter</kbd> for new line</div>
       </div>
     </main>
-  </div>
 
-  <script src="/static/app.js?v=8"></script>
+    <!-- ── INVOICES PAGE ──────────────────────────────────────────────── -->
+    <main class="page-content hidden" id="page-invoices">
+      <header class="page-header">
+        <div>
+          <h2>Invoices</h2>
+          <span class="page-header-sub">All your Zoho invoices in one place</span>
+        </div>
+        <button class="btn-refresh" id="btn-refresh-invoices" onclick="refreshInvoices()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          Refresh
+        </button>
+      </header>
+
+      <!-- Tabs -->
+      <div class="tab-bar">
+        <button class="tab-btn active" id="tab-all" onclick="switchInvoiceTab('all')">
+          📄 All Invoices
+        </button>
+        <button class="tab-btn" id="tab-recurring" onclick="switchInvoiceTab('recurring')">
+          🔁 Recurring
+        </button>
+      </div>
+
+      <!-- All Invoices Tab -->
+      <div id="inv-all-panel" class="tab-panel">
+        <!-- Filter chips -->
+        <div class="filter-chips">
+          <button class="chip active" data-filter="all" onclick="filterInvoices(this, 'all')">All</button>
+          <button class="chip" data-filter="sent" onclick="filterInvoices(this, 'sent')">Sent</button>
+          <button class="chip" data-filter="paid" onclick="filterInvoices(this, 'paid')">Paid</button>
+          <button class="chip" data-filter="overdue" onclick="filterInvoices(this, 'overdue')">Overdue</button>
+          <button class="chip" data-filter="draft" onclick="filterInvoices(this, 'draft')">Draft</button>
+        </div>
+
+        <div class="table-wrapper">
+          <table class="data-table" id="invoices-table">
+            <thead>
+              <tr>
+                <th>Invoice #</th>
+                <th>Client</th>
+                <th>Amount</th>
+                <th>Balance Due</th>
+                <th>Status</th>
+                <th>Date</th>
+                <th>Due Date</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="invoices-tbody">
+              <tr class="table-loading"><td colspan="8">Loading invoices…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Recurring Tab -->
+      <div id="inv-recurring-panel" class="tab-panel hidden">
+        <div class="table-wrapper">
+          <table class="data-table" id="recurring-table">
+            <thead>
+              <tr>
+                <th>Service</th>
+                <th>Client</th>
+                <th>Amount</th>
+                <th>Frequency</th>
+                <th>Start Date</th>
+                <th>Next Invoice</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="recurring-tbody">
+              <tr class="table-loading"><td colspan="7">Loading recurring invoices…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+
+    <!-- ── ANALYTICS PAGE ─────────────────────────────────────────────── -->
+    <main class="page-content hidden" id="page-analytics">
+      <header class="page-header">
+        <div>
+          <h2>Analytics</h2>
+          <span class="page-header-sub">Your invoice performance at a glance</span>
+        </div>
+        <button class="btn-refresh" id="btn-refresh-stats" onclick="loadStats()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          Refresh
+        </button>
+      </header>
+
+      <!-- Stat Cards -->
+      <div class="stat-cards" id="stat-cards">
+        <div class="stat-card outstanding">
+          <div class="stat-icon">💰</div>
+          <div class="stat-body">
+            <div class="stat-label">Outstanding</div>
+            <div class="stat-value" id="stat-outstanding">—</div>
+            <div class="stat-sub" id="stat-sent-count">— invoices unpaid</div>
+          </div>
+        </div>
+        <div class="stat-card collected">
+          <div class="stat-icon">✅</div>
+          <div class="stat-body">
+            <div class="stat-label">Collected This Month</div>
+            <div class="stat-value" id="stat-collected">—</div>
+            <div class="stat-sub" id="stat-paid-count">— invoices paid</div>
+          </div>
+        </div>
+        <div class="stat-card overdue">
+          <div class="stat-icon">⚠️</div>
+          <div class="stat-body">
+            <div class="stat-label">Overdue</div>
+            <div class="stat-value" id="stat-overdue-count">—</div>
+            <div class="stat-sub" id="stat-overdue-amount">₹— total overdue</div>
+          </div>
+        </div>
+        <div class="stat-card recurring">
+          <div class="stat-icon">🔁</div>
+          <div class="stat-body">
+            <div class="stat-label">Active Recurring</div>
+            <div class="stat-value" id="stat-recurring-count">—</div>
+            <div class="stat-sub">Profiles running</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Charts Row -->
+      <div class="charts-grid">
+        <div class="chart-card chart-wide">
+          <div class="chart-card-header">
+            <span class="chart-title">Revenue — Last 6 Months</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-revenue"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-card">
+          <div class="chart-card-header">
+            <span class="chart-title">Invoice Status Breakdown</span>
+          </div>
+          <div class="chart-container chart-donut-container">
+            <canvas id="chart-status"></canvas>
+          </div>
+        </div>
+      </div>
+    </main>
+
+  </div><!-- /chat-screen -->
+
+  <script src="/static/app.js?v=14"></script>
 </body>
 
 </html>

@@ -14,7 +14,7 @@ _SYSTEM_PROMPT = """You are an intent parser for a smart invoicing assistant. Yo
 
 Return ONLY a valid JSON object with this exact structure:
 {
-  "action": "create_invoice" | "scan_emails" | "approve_draft" | "decline_draft" | "send_invoices" | "check_overdue" | "check_pending" | "check_specific_payment" | "payment_summary" | "greeting" | "unknown",
+  "action": "create_invoice" | "scan_emails" | "approve_draft" | "decline_draft" | "send_invoices" | "check_overdue" | "check_pending" | "check_specific_payment" | "payment_summary" | "create_recurring" | "list_recurring" | "stop_recurring" | "greeting" | "unknown",
   "person_name": "<name or null>",
   "date_filter": "today" | "yesterday" | "this_week" | "last_week" | "last_sunday" | "last_monday" | "last_tuesday" | "last_wednesday" | "last_thursday" | "last_friday" | "last_saturday" | "this_sunday" | "this_monday" | "this_tuesday" | "this_wednesday" | "this_thursday" | "this_friday" | "this_saturday" | null,
   "keywords": ["<keyword1>", "<keyword2>"]
@@ -31,6 +31,9 @@ Rules:
   - "check_pending" when user asks who hasn't paid or asks about pending/unpaid/outstanding invoices (e.g. "Who hasn't paid me?", "What's pending payment?", "Any unpaid invoices?")
   - "check_specific_payment" when user asks if a specific person paid (e.g. "Did Rahul pay?", "Has Piyusha paid?") — set person_name to that client name
   - "payment_summary" when user wants an overview of owed/received amounts (e.g. "Payment summary", "How much am I owed?")
+  - "create_recurring" when user wants to set up a recurring / repeating / subscription invoice (e.g. "recurring invoice", "monthly invoice", "bill every month", "set up recurring")
+  - "list_recurring" when user wants to see active recurring invoices (e.g. "show recurring", "list recurring", "active recurring invoices")
+  - "stop_recurring" when user wants to stop/cancel/pause a recurring invoice (e.g. "stop recurring", "cancel recurring invoice", "pause billing")
   - "greeting" when user just says hi, hello, hey, thanks, etc. — no task intended
   - "unknown" if genuinely unclear
 - person_name: the PERSON's name if explicitly mentioned (e.g. "Piyusha", "James", "Rahul"). Required for check_specific_payment. null otherwise. Do NOT infer names from context.
@@ -51,8 +54,6 @@ _MANUAL_INVOICE_PROMPT = """You extract manual invoice details from a user's mes
 Return ONLY a valid JSON object with this exact structure:
 {
   "is_manual_invoice_request": true,
-  "client_name": "<name or null>",
-  "client_email": "<email or null>",
   "currency": "<3-letter ISO code or null>",
   "send_email": true | false | null,
   "items": [
@@ -97,6 +98,17 @@ async def parse_intent(message: str) -> dict:
         or "outstanding" in normalized
     ):
         return {"action": "check_pending", "person_name": None, "date_filter": None, "keywords": ["payment"]}
+
+    # ── Recurring invoice shortcuts ───────────────────────────────────────────
+    _RECURRING_WORDS = ("recurring", "repeating", "subscription", "every month", "every week", "every year", "monthly invoice", "weekly invoice", "yearly invoice")
+    has_recurring = any(w in normalized for w in _RECURRING_WORDS)
+    if has_recurring:
+        if any(w in normalized for w in ("stop", "cancel", "pause", "end", "disable")):
+            return {"action": "stop_recurring", "person_name": None, "date_filter": None, "keywords": []}
+        if any(w in normalized for w in ("list", "show", "view", "active", "all")):
+            return {"action": "list_recurring", "person_name": None, "date_filter": None, "keywords": []}
+        # Default: intent to create
+        return {"action": "create_recurring", "person_name": None, "date_filter": None, "keywords": []}
 
     # ── Date-filter guard ────────────────────────────────────────────────────
     # If the message mentions a time window AND a scan verb, it's always a
@@ -174,4 +186,83 @@ async def extract_manual_invoice_request(message: str) -> dict:
             "currency": None,
             "send_email": None,
             "items": [],
+        }
+
+
+_RECURRING_EXTRACT_PROMPT = """You extract recurring invoice details from a user message.
+
+Return ONLY a valid JSON object:
+{
+  "client_name": "<full name or null>",
+  "client_email": "<real email with @ or null>",
+  "item_name": "<short 2-5 word service label or null>",
+  "task_description": "<description of service or null>",
+  "amount": <number or null>,
+  "currency": "<3-letter ISO code, default INR>",
+  "frequency": "monthly" | "weekly" | "yearly" | "daily" | null,
+  "start_date": "<YYYY-MM-DD or 'today' or null>",
+  "end_date": "<YYYY-MM-DD or null>"
+}
+
+Rules:
+- CRITICAL: Only extract information that is explicitly stated or directly implied in the user's message.
+- CRITICAL: If any field (such as client_name, client_email, amount, frequency, start_date, etc.) is missing or not provided in the message, you MUST set it to null. Do NOT use placeholder values, dummy data, or examples (like 'John Doe', 'john.doe@example.com', '5000', or default dates).
+- frequency: infer from words like "monthly", "every month", "weekly", "every week", "yearly", "annual", "daily".
+- start_date: if user says "today" return "today"; if a specific date is given convert to YYYY-MM-DD; otherwise null.
+- end_date: only if user explicitly mentions a stop/end date; otherwise null.
+- amount: strip currency symbols. If INR/₹/Rs set currency INR.
+
+Examples:
+User: "setup a recurring invoice"
+Output:
+{
+  "client_name": null,
+  "client_email": null,
+  "item_name": null,
+  "task_description": null,
+  "amount": null,
+  "currency": "INR",
+  "frequency": null,
+  "start_date": null,
+  "end_date": null
+}
+
+User: "create a monthly recurring invoice for Jash for ₹15000 starting today"
+Output:
+{
+  "client_name": "Jash",
+  "client_email": null,
+  "item_name": null,
+  "task_description": null,
+  "amount": 15000,
+  "currency": "INR",
+  "frequency": "monthly",
+  "start_date": "today",
+  "end_date": null
+}
+
+Return ONLY the JSON object, no explanation."""
+
+
+async def extract_recurring_details(message: str) -> dict:
+    """Extract recurring invoice fields from a free-form user message."""
+    try:
+        response = await asyncio.to_thread(
+            _client.chat.completions.create,
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": _RECURRING_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=200,
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Recurring details extraction failed: {e}")
+        return {
+            "client_name": None, "client_email": None, "item_name": None,
+            "task_description": None, "amount": None, "currency": "INR",
+            "frequency": None, "start_date": None, "end_date": None,
         }

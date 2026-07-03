@@ -147,10 +147,22 @@ def _md(text: str) -> str:
 def _md_safe(text: str) -> str:
     """
     Safely convert **bold** / *italic* markdown to HTML.
-    Escapes raw text portions while preserving bold/italic tags.
+    Also supports Markdown links like [label](url) and converts them to HTML <a> links.
+    Escapes raw text portions while preserving bold/italic/link tags.
     """
     import re
-    parts = re.split(r"(\*\*.+?\*\*|\*.+?\*)", text)
+    # 1. Extract markdown links and replace them with tokens
+    links = []
+    def link_repl(match):
+        label, url = match.group(1), match.group(2)
+        token = f"__TG_CHAT_LINK_{len(links)}__"
+        links.append((label, url))
+        return token
+    
+    text_with_tokens = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", link_repl, text)
+    
+    # 2. Run standard split & bold/italic parsing on text_with_tokens
+    parts = re.split(r"(\*\*.+?\*\*|\*.+?\*)", text_with_tokens)
     result = []
     for part in parts:
         if part.startswith("**") and part.endswith("**"):
@@ -159,7 +171,15 @@ def _md_safe(text: str) -> str:
             result.append(f"<i>{_e(part[1:-1])}</i>")
         else:
             result.append(_e(part))
-    return "".join(result)
+            
+    html_result = "".join(result)
+    
+    # 3. Replace link tokens back with escaped label and raw URL HTML
+    for i, (label, url) in enumerate(links):
+        link_html = f'<a href="{_e(url)}">{_e(label)}</a>'
+        html_result = html_result.replace(f"__TG_CHAT_LINK_{i}__", link_html)
+        
+    return html_result
 
 
 # ── Response rendering ────────────────────────────────────────────────────────
@@ -435,16 +455,17 @@ async def _run_chat_flow(
             pass  # ignore if message can't be edited (too many edits, etc.)
 
     async with AsyncSessionLocal() as db:
-        response = await process_chat(message_text, db, status_cb=status_cb)
+        response = await process_chat(message_text, db, status_cb=status_cb, session_key=user.id)
 
-    # Delete the status message
+    # Delete status message
     try:
         await status_msg.delete()
     except Exception:
         pass
 
     # ── Reply text ────────────────────────────────────────────────────────────
-    await update.message.reply_text(_md_safe(response.reply), parse_mode=ParseMode.HTML)
+    if response.action not in ("recurring_pending", "recurring_list"):
+        await update.message.reply_text(_md_safe(response.reply), parse_mode=ParseMode.HTML)
 
     # ── Payment invoice cards ─────────────────────────────────────────────────
     if response.payment_invoices:
@@ -488,6 +509,41 @@ async def _run_chat_flow(
             parse_mode=ParseMode.HTML,
             reply_markup=_render_manual_invoice_keyboard(draft.draft_id),
         )
+
+    # ── Recurring invoice: confirm card (pending) ─────────────────────────────
+    if response.action == "recurring_pending":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm & Create", callback_data=f"confirm_recurring:{user.id}"),
+            InlineKeyboardButton("✗ Cancel",           callback_data=f"cancel_recurring:{user.id}"),
+        ]])
+        await update.message.reply_text(
+            _md_safe(response.reply),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+
+    # ── Recurring list: add ⏹ Stop buttons ───────────────────────────────────
+    if response.action == "recurring_list":
+        from backend.services.pipeline import _pending_recurring_list
+        raw_list = _pending_recurring_list.get(user.id, [])
+        if raw_list:
+            buttons = [
+                [InlineKeyboardButton(
+                    f"⏹ Stop #{i}  {inv.get('recurrence_name') or inv.get('customer_name','')}",
+                    callback_data=f"stop_recurring:{inv.get('recurring_invoice_id')}",
+                )]
+                for i, inv in enumerate(raw_list, 1)
+            ]
+            await update.message.reply_text(
+                _md_safe(response.reply),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        else:
+            await update.message.reply_text(_md_safe(response.reply), parse_mode=ParseMode.HTML)
+        return
+
 
 
 async def cmd_get_mails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -550,6 +606,37 @@ async def cmd_payment_status_of(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await _run_chat_flow(update, context, f"Did {client_name} pay?")
+
+
+async def cmd_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a recurring invoice — optionally pass all fields inline."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text(_not_allowed_reply())
+        return
+    args_text = " ".join(context.args).strip()
+    prompt = args_text if args_text else "I want to create a recurring invoice"
+    await _run_chat_flow(update, context, prompt)
+
+
+async def cmd_list_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all active recurring invoices with inline Stop buttons."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text(_not_allowed_reply())
+        return
+    await _run_chat_flow(update, context, "list recurring invoices")
+
+
+async def cmd_stop_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop one or more recurring invoices. Pass numbers to stop directly."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text(_not_allowed_reply())
+        return
+    args_text = " ".join(context.args).strip()
+    prompt = f"stop recurring {args_text}" if args_text else "stop recurring invoice"
+    await _run_chat_flow(update, context, prompt)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -750,6 +837,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
         return
 
+    # ── Recurring: confirm create ─────────────────────────────────────────────
+    if data.startswith("confirm_recurring:"):
+        await query.edit_message_text("⏳ Creating recurring invoice…")
+        async with AsyncSessionLocal() as db:
+            response = await process_chat("confirm", db, session_key=user.id)
+        await query.edit_message_text(response.reply, parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("cancel_recurring:"):
+        from backend.services.pipeline import _pending_recurring_conv
+        _pending_recurring_conv.pop(user.id, None)
+        await query.edit_message_text("Recurring invoice cancelled. ✗")
+        return
+
+    # ── Recurring: stop one invoice ───────────────────────────────────────────
+    if data.startswith("stop_recurring:"):
+        recurring_id = data.split(":", 1)[1]
+        await query.edit_message_text("⏹ Stopping recurring invoice…")
+        from backend.services.zoho_service import stop_recurring_invoice, recurring_invoice_url
+        async with AsyncSessionLocal() as db:
+            ok = await stop_recurring_invoice(recurring_id, db)
+        url = recurring_invoice_url(recurring_id)
+        if ok:
+            await query.edit_message_text(
+                f"✅ Recurring invoice stopped.\n\n🔗 <b><a href=\"{_e(url)}\">View Profile in Zoho</a></b>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.edit_message_text(
+                f"⚠️ Could not stop recurring invoice.\n\n🔗 <b><a href=\"{_e(url)}\">Check on Zoho</a></b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
     # Unknown callback
     await query.answer("Unknown action.", show_alert=True)
 
@@ -768,13 +889,16 @@ async def post_init(application: Application) -> None:
         )
     # Register bot commands in Telegram menu
     await application.bot.set_my_commands([
-        BotCommand("start", "Welcome message & usage guide"),
-        BotCommand("status", "Check Gmail & Zoho connection status"),
-        BotCommand("get_mails", "Scan emails for a timeframe like today or last week"),
-        BotCommand("payment_status", "Show overall payment summary and status"),
+        BotCommand("start",             "Welcome message & usage guide"),
+        BotCommand("status",            "Check Gmail & Zoho connection status"),
+        BotCommand("get_mails",         "Scan emails for a timeframe like today or last week"),
+        BotCommand("payment_status",    "Show overall payment summary and status"),
         BotCommand("payment_status_of", "Check payment status of one client"),
-        BotCommand("cancel", "Cancel a pending command prompt"),
-        BotCommand("myid", "Show your Telegram user ID"),
+        BotCommand("recurring",         "Create a recurring invoice"),
+        BotCommand("list_recurring",    "List all active recurring invoices"),
+        BotCommand("stop_recurring",    "Stop one or more recurring invoices"),
+        BotCommand("cancel",            "Cancel a pending command prompt"),
+        BotCommand("myid",              "Show your Telegram user ID"),
     ])
     logger.info("Bot commands registered.")
 
@@ -802,13 +926,30 @@ if __name__ == "__main__":
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("get_mails", cmd_get_mails))
-    app.add_handler(CommandHandler("payment_status", cmd_payment_status))
+    # ── Global error handler — keeps the bot alive on network blips ───────────
+    from telegram.error import TimedOut, NetworkError as TgNetworkError
+
+    async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if isinstance(err, (TimedOut, TgNetworkError)):
+            # Transient connectivity issue — log and keep running
+            logger.warning(f"Telegram network error (ignored): {err}")
+            return
+        # Genuine application error — log the full traceback
+        logger.error("Unhandled exception in bot handler", exc_info=context.error)
+
+    app.add_error_handler(_error_handler)
+
+    app.add_handler(CommandHandler("start",             cmd_start))
+    app.add_handler(CommandHandler("status",            cmd_status))
+    app.add_handler(CommandHandler("get_mails",         cmd_get_mails))
+    app.add_handler(CommandHandler("payment_status",    cmd_payment_status))
     app.add_handler(CommandHandler("payment_status_of", cmd_payment_status_of))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("recurring",         cmd_recurring))
+    app.add_handler(CommandHandler("list_recurring",    cmd_list_recurring))
+    app.add_handler(CommandHandler("stop_recurring",    cmd_stop_recurring))
+    app.add_handler(CommandHandler("cancel",            cmd_cancel))
+    app.add_handler(CommandHandler("myid",              cmd_myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 

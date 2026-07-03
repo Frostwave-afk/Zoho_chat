@@ -288,23 +288,62 @@ function buildInvoiceCard(inv) {
   return card;
 }
 
+function cancelManualInvoice(draftId) {
+  const card = document.getElementById(`manual-draft-${draftId}`);
+  if (card) {
+    card.style.transition = 'opacity 0.25s, transform 0.25s';
+    card.style.opacity = '0';
+    card.style.transform = 'scale(0.97)';
+    setTimeout(() => card.remove(), 260);
+  }
+  appendAgentMessage('Invoice cancelled. Let me know if you need anything else.');
+}
+
 function buildManualInvoiceCard(draft) {
   const card = document.createElement('div');
-  card.className = 'draft-card' + (draft.is_new_contact ? ' new-contact-card' : '');
+  card.className = 'draft-card manual-invoice-card' + (draft.is_new_contact ? ' new-contact-card' : '');
   card.id = `manual-draft-${draft.draft_id}`;
 
-  const itemsHtml = draft.line_items.map((item, index) => `
-    <div class="draft-field full-width">
-      <label>Item ${index + 1}</label>
-      <div>${escapeHtml(item.item_name)} — ${escapeHtml(draft.currency)} ${Number(item.amount).toLocaleString()}</div>
-      <div class="draft-inline-help">${escapeHtml(item.task_description)}</div>
+  const badge = draft.is_new_contact
+    ? `<span class="draft-badge new-contact-badge">👤 New Contact + Invoice</span>`
+    : `<span class="draft-badge">Invoice Draft</span>`;
+
+  const itemsHtml = draft.line_items.map((item, idx) => `
+    <div class="manual-item-row" id="manual-item-row-${draft.draft_id}-${idx}">
+      <div class="manual-item-header">
+        <span class="manual-item-label">Item ${idx + 1}</span>
+      </div>
+      <div class="draft-fields manual-item-fields">
+        <div class="draft-field">
+          <label>Service / Name</label>
+          <input type="text"
+            class="manual-item-name"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${escapeHtml(item.item_name)}"
+            placeholder="e.g. Website Redesign" />
+        </div>
+        <div class="draft-field">
+          <label>Description</label>
+          <input type="text"
+            class="manual-item-desc"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${escapeHtml(item.task_description)}"
+            placeholder="Full description" />
+        </div>
+        <div class="draft-field draft-field-amount">
+          <label>Amount (${escapeHtml(draft.currency || 'INR')})</label>
+          <input type="number"
+            class="manual-item-amount"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${Number(item.amount)}"
+            placeholder="0"
+            oninput="recalcManualTotal('${draft.draft_id}')" />
+        </div>
+      </div>
     </div>
   `).join('');
 
-  const total = draft.line_items.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-  const badge = draft.is_new_contact
-    ? `<span class="draft-badge new-contact-badge">👤 New Contact + Invoice</span>`
-    : `<span class="draft-badge">Manual Invoice Draft</span>`;
+  const total = draft.line_items.reduce((s, i) => s + Number(i.amount || 0), 0);
 
   card.innerHTML = `
     <div class="draft-header">
@@ -314,30 +353,114 @@ function buildManualInvoiceCard(draft) {
     <div class="draft-fields">
       <div class="draft-field">
         <label>Client Name</label>
-        <div>${escapeHtml(draft.client_name)}</div>
+        <input type="text" id="manual-client-name-${draft.draft_id}"
+          value="${escapeHtml(draft.client_name || '')}"
+          placeholder="Client name" />
+      </div>
+      <div class="draft-field">
+        <label>Email</label>
+        <input type="email" id="manual-client-email-${draft.draft_id}"
+          value="${escapeHtml(draft.client_email || '')}"
+          placeholder="client@example.com" />
+      </div>
+    </div>
+    <div class="manual-items-section">
+      ${itemsHtml}
+    </div>
+
+    <div class="draft-actions">
+      <button class="btn-approve ${draft.is_new_contact ? 'btn-new-contact' : ''}"
+        id="manual-approve-${draft.draft_id}"
+        onclick="approveManualInvoice('${draft.draft_id}', false)">
+        ${draft.is_new_contact ? '👤 Create Contact & Invoice' : '✓ Create Invoice'}
+      </button>
+      <button class="btn-approve-send"
+        id="manual-approve-send-${draft.draft_id}"
+        onclick="approveManualInvoice('${draft.draft_id}', true)">
+        ${draft.is_new_contact ? '👤 Create Contact & Send' : '📧 Create & Send Invoice'}
+      </button>
+      <button class="btn-close-action" title="Cancel" onclick="cancelManualInvoice('${draft.draft_id}')">✕</button>
+    </div>`;
+  return card;
+}
+
+function recalcManualTotal(draftId) {
+  const amounts = document.querySelectorAll(`.manual-item-amount[data-draft="${draftId}"]`);
+  const total = Array.from(amounts).reduce((s, el) => s + (parseFloat(el.value) || 0), 0);
+  const el = document.getElementById(`manual-total-${draftId}`);
+  if (el) {
+    const cur = amounts[0]?.closest('.draft-field')?.querySelector('label')?.textContent?.match(/\(([^)]+)\)/)?.[1] || 'INR';
+    el.textContent = `${cur} ${total.toLocaleString('en-IN')}`;
+  }
+}
+
+function buildRecurringInvoiceCard(draft) {
+  const card = document.createElement('div');
+  card.className = 'draft-card';
+  card.id = `recurring-draft`;
+
+  const total = Number(draft.amount || 0);
+  const badge = `<span class="draft-badge">Recurring Invoice Draft</span>`;
+
+  card.innerHTML = `
+    <div class="draft-header">
+      ${badge}
+      <span class="draft-subject">${escapeHtml(draft.client_name || 'New Profile')}</span>
+    </div>
+    <div class="draft-fields">
+      <div class="draft-field">
+        <label>Client Name</label>
+        <div>${escapeHtml(draft.client_name || '—')}</div>
       </div>
       <div class="draft-field">
         <label>Email</label>
         <div>${escapeHtml(draft.client_email || '—')}</div>
       </div>
-      ${itemsHtml}
       <div class="draft-field">
-        <label>Total</label>
-        <div>${escapeHtml(draft.currency)} ${Number(total).toLocaleString()}</div>
+        <label>Service/Item</label>
+        <div>${escapeHtml(draft.item_name || draft.task_description || 'Monthly Service')}</div>
+      </div>
+      <div class="draft-field">
+        <label>Amount</label>
+        <div>${escapeHtml(draft.currency || 'INR')} ${total.toLocaleString()}</div>
+      </div>
+      <div class="draft-field">
+        <label>Frequency</label>
+        <div>${escapeHtml(draft.frequency || 'Monthly')}</div>
+      </div>
+      <div class="draft-field">
+        <label>Start Date</label>
+        <div>${escapeHtml(draft.start_date || 'Today')}</div>
       </div>
     </div>
     <div class="draft-actions">
-      <button class="btn-approve ${draft.is_new_contact ? 'btn-new-contact' : ''}" id="manual-approve-${draft.draft_id}" onclick="approveManualInvoice('${draft.draft_id}', false)">
-        ${draft.is_new_contact ? '👤 Create Contact & Invoice' : '✓ Create Invoice'}
+      <button class="btn-approve" id="recurring-confirm-btn" onclick="submitRecurringApproval(true)">
+        ✓ Confirm & Create
       </button>
-      <button class="btn-approve-send" id="manual-approve-send-${draft.draft_id}" onclick="approveManualInvoice('${draft.draft_id}', true)">
-        ${draft.is_new_contact ? '👤 Create Contact & Send Invoice' : '📧 Create & Send Invoice'}
-      </button>
+      <button class="btn-close-action" title="Cancel" onclick="submitRecurringApproval(false)">✕</button>
     </div>`;
   return card;
 }
 
+async function submitRecurringApproval(confirm) {
+  const confirmBtn = document.getElementById('recurring-confirm-btn');
+  const cancelBtn = document.getElementById('recurring-cancel-btn');
+  if (confirmBtn) confirmBtn.disabled = true;
+  if (cancelBtn) cancelBtn.disabled = true;
+  if (confirmBtn && confirm) confirmBtn.textContent = 'Creating…';
+  
+  // Set value and send
+  chatInput.value = confirm ? "confirm" : "cancel";
+  document.getElementById('recurring-draft')?.remove();
+  
+  await sendMessage();
+}
+
 function appendExtraCards(extra, data) {
+  if (data.recurring_draft) {
+    extra.appendChild(buildRecurringInvoiceCard(data.recurring_draft));
+    return;
+  }
   if (data.manual_invoice_draft) {
     extra.appendChild(buildManualInvoiceCard(data.manual_invoice_draft));
     return;
@@ -408,7 +531,7 @@ async function sendMessage() {
           removeStatusBubble();
           const data  = payload;
           let   extra = null;
-          if (data.manual_invoice_draft || data.batch_draft || data.drafts?.length || data.invoices_created?.length) {
+          if (data.manual_invoice_draft || data.batch_draft || data.drafts?.length || data.invoices_created?.length || data.recurring_draft) {
             extra = document.createDocumentFragment();
             appendExtraCards(extra, data);
           }
@@ -482,20 +605,38 @@ async function approveDraft(draftId, sendEmail = false) {
 
 async function approveManualInvoice(draftId, sendEmail = false) {
   const approveBtn = document.getElementById(`manual-approve-${draftId}`);
-  const sendBtn = document.getElementById(`manual-approve-send-${draftId}`);
-  const activeBtn = sendEmail ? sendBtn : approveBtn;
+  const sendBtn    = document.getElementById(`manual-approve-send-${draftId}`);
+  const activeBtn  = sendEmail ? sendBtn : approveBtn;
 
   if (approveBtn) approveBtn.disabled = true;
-  if (sendBtn) sendBtn.disabled = true;
-  if (activeBtn) activeBtn.textContent = sendEmail ? 'Sending…' : 'Processing…';
+  if (sendBtn)    sendBtn.disabled    = true;
+  if (activeBtn)  activeBtn.textContent = sendEmail ? 'Sending…' : 'Processing…';
+
+  // Read edited values from the card inputs
+  const clientName  = document.getElementById(`manual-client-name-${draftId}`)?.value?.trim()  || '';
+  const clientEmail = document.getElementById(`manual-client-email-${draftId}`)?.value?.trim() || '';
+
+  // Collect edited line items
+  const nameInputs   = document.querySelectorAll(`.manual-item-name[data-draft="${draftId}"]`);
+  const descInputs   = document.querySelectorAll(`.manual-item-desc[data-draft="${draftId}"]`);
+  const amountInputs = document.querySelectorAll(`.manual-item-amount[data-draft="${draftId}"]`);
+  const line_items = Array.from(nameInputs).map((el, i) => ({
+    item_name:        el.value.trim() || 'Service',
+    task_description: descInputs[i]?.value?.trim() || el.value.trim(),
+    amount:           parseFloat(amountInputs[i]?.value) || 0,
+  }));
 
   try {
     const res = await fetch('/chat/manual-approve', {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        draft_id: draftId,
-        send_email: sendEmail,
+        draft_id:     draftId,
+        send_email:   sendEmail,
+        // Pass edited values so backend can use them
+        client_name:  clientName,
+        client_email: clientEmail,
+        line_items,
       }),
     });
     const data = await res.json();
@@ -509,18 +650,13 @@ async function approveManualInvoice(draftId, sendEmail = false) {
     appendAgentMessage(data.reply, extra);
     scrollToBottom();
   } catch (e) {
-    if (approveBtn) {
-      approveBtn.disabled = false;
-      approveBtn.textContent = '✓ Create Invoice';
-    }
-    if (sendBtn) {
-      sendBtn.disabled = false;
-      sendBtn.textContent = '📧 Create & Send Invoice';
-    }
-    appendAgentMessage('Failed to create manual invoice — please try again.');
+    if (approveBtn) { approveBtn.disabled = false; approveBtn.textContent = '✓ Create Invoice'; }
+    if (sendBtn)    { sendBtn.disabled    = false; sendBtn.textContent    = '📧 Create & Send Invoice'; }
+    appendAgentMessage('Failed to create invoice — please try again.');
     console.error(e);
   }
 }
+
 
 /* ─── Send invoice email ─────────────────────────────────────────────────── */
 async function sendInvoice(invoiceId, clientName, btnEl) {
@@ -590,9 +726,6 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
-
-/* ─── Boot ───────────────────────────────────────────────────────────────── */
-checkAuthStatus();
 
 /* ─── Batch Draft Handling ────────────────────────────────────────────────── */
 function buildBatchCard(batch) {
@@ -712,3 +845,291 @@ async function approveBatch(batchId, mode) {
     if (btnComb)      btnComb.textContent      = '🔗📤 Combine & Send';
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   PAGE ROUTING
+   ══════════════════════════════════════════════════════════════════════════ */
+
+let _chartRevenue = null;
+let _chartStatus  = null;
+let _currentPage  = 'chat';
+
+function showPage(name) {
+  _currentPage = name;
+
+  // Toggle page panels
+  document.querySelectorAll('.page-content').forEach(el => el.classList.add('hidden'));
+  const target = document.getElementById(`page-${name}`);
+  if (target) target.classList.remove('hidden');
+
+  // Update nav active states
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const navEl = document.getElementById(`nav-${name}`);
+  if (navEl) navEl.classList.add('active');
+
+  // Lazy-load data
+  if (name === 'invoices') refreshInvoices();
+  if (name === 'analytics') loadStats();
+}
+
+/* ── Invoices Page ─────────────────────────────────────────────────────── */
+
+function refreshInvoices() {
+  const activeTab = document.querySelector('.tab-btn.active');
+  const tab = activeTab ? activeTab.id.replace('tab-', '') : 'all';
+  if (tab === 'recurring') loadRecurring();
+  else {
+    const activeChip = document.querySelector('.chip.active');
+    const filter = activeChip ? (activeChip.dataset.filter || 'all') : 'all';
+    loadInvoices(filter);
+  }
+}
+
+function switchInvoiceTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+  document.getElementById('tab-' + tab)?.classList.add('active');
+  document.getElementById(tab === 'all' ? 'inv-all-panel' : 'inv-recurring-panel')?.classList.remove('hidden');
+  if (tab === 'recurring') loadRecurring();
+  else loadInvoices('all');
+}
+
+function filterInvoices(chipEl, filter) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  chipEl.classList.add('active');
+  loadInvoices(filter);
+}
+
+function formatCurrency(value, currency) {
+  const cur = currency || 'INR';
+  const num = parseFloat(value) || 0;
+  const sym = cur === 'INR' ? '₹' : (cur === 'USD' ? '$' : cur + ' ');
+  return sym + num.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+async function loadInvoices(filter) {
+  filter = filter || 'all';
+  const tbody = document.getElementById('invoices-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '<tr class="table-loading"><td colspan="8">Loading invoices…</td></tr>';
+
+  try {
+    const res  = await fetch('/api/invoices?status=' + filter);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    const invoices = data.invoices || [];
+    if (!invoices.length) {
+      tbody.innerHTML = '<tr class="table-empty"><td colspan="8">No invoices found.</td></tr>';
+      return;
+    }
+
+    const badgeMap = { sent: 'badge-sent', paid: 'badge-paid', overdue: 'badge-overdue', draft: 'badge-draft', void: 'badge-void' };
+    const dotMap   = { sent: '●', paid: '●', overdue: '⚠', draft: '○', void: '○' };
+
+    tbody.innerHTML = invoices.map(inv => {
+      const status   = (inv.status || 'draft').toLowerCase();
+      const badgeCls = badgeMap[status] || 'badge-draft';
+      const dot      = dotMap[status] || '○';
+      const amount   = formatCurrency(inv.total, inv.currency_code);
+      const balance  = status === 'paid'
+        ? '<span style="color:var(--success)">Paid</span>'
+        : formatCurrency(inv.balance, inv.currency_code);
+      const date     = inv.invoice_date   || '—';
+      const due      = inv.due_date       || '—';
+      const invNum   = inv.invoice_number || inv.invoice_id || '—';
+      const client   = inv.customer_name  || '—';
+      const url      = inv.invoice_url    || '#';
+      return `<tr>
+        <td class="td-muted">${escapeHtml(String(invNum))}</td>
+        <td><strong>${escapeHtml(String(client))}</strong></td>
+        <td class="td-amount">${amount}</td>
+        <td class="td-amount">${balance}</td>
+        <td><span class="status-badge ${badgeCls}">${dot} ${status}</span></td>
+        <td class="td-muted">${escapeHtml(String(date))}</td>
+        <td class="td-muted">${escapeHtml(String(due))}</td>
+        <td class="td-link"><a href="${escapeHtml(url)}" target="_blank" rel="noopener">View →</a></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="table-empty"><td colspan="8">⚠️ ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function loadRecurring() {
+  const tbody = document.getElementById('recurring-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '<tr class="table-loading"><td colspan="7">Loading recurring invoices…</td></tr>';
+
+  try {
+    const res  = await fetch('/api/invoices/recurring');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    const invoices = data.recurring_invoices || [];
+    if (!invoices.length) {
+      tbody.innerHTML = '<tr class="table-empty"><td colspan="7">No active recurring invoices.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = invoices.map(inv => {
+      const name   = inv.recurrence_name || inv.customer_name || '—';
+      const client = inv.customer_name   || '—';
+      const freq   = inv.recurrence_frequency || '—';
+      const amount = formatCurrency(inv.total || inv.amount || 0, inv.currency_code || 'INR');
+      const start  = inv.start_date          || '—';
+      const next   = inv.next_invoice_date   || '—';
+      const url    = inv.recurring_invoice_url || '#';
+      return `<tr>
+        <td><strong>${escapeHtml(String(name))}</strong></td>
+        <td class="td-muted">${escapeHtml(String(client))}</td>
+        <td class="td-amount">${amount}</td>
+        <td><span class="freq-badge">${escapeHtml(String(freq))}</span></td>
+        <td class="td-muted">${escapeHtml(String(start))}</td>
+        <td class="td-muted">${escapeHtml(String(next))}</td>
+        <td class="td-link"><a href="${escapeHtml(url)}" target="_blank" rel="noopener">View →</a></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="table-empty"><td colspan="7">⚠️ ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+/* ── Analytics Page ────────────────────────────────────────────────────── */
+
+async function loadStats() {
+  const statIds = ['stat-outstanding','stat-collected','stat-overdue-count',
+                   'stat-recurring-count','stat-sent-count','stat-paid-count','stat-overdue-amount'];
+  statIds.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '…'; });
+
+  try {
+    const res  = await fetch('/api/stats');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    document.getElementById('stat-outstanding').textContent     = formatCurrency(data.outstanding_amount);
+    document.getElementById('stat-collected').textContent       = formatCurrency(data.collected_this_month);
+    document.getElementById('stat-overdue-count').textContent   = data.overdue_count;
+    document.getElementById('stat-recurring-count').textContent = data.recurring_count;
+    document.getElementById('stat-sent-count').textContent      = (data.sent_count || 0) + ' invoices unpaid';
+    document.getElementById('stat-paid-count').textContent      = (data.paid_count_this_month || 0) + ' invoices paid';
+    document.getElementById('stat-overdue-amount').textContent  = formatCurrency(data.overdue_amount) + ' overdue';
+
+    // ── Revenue line chart ──────────────────────────────────────────────
+    const revenueData = data.revenue_history || [];
+    if (_chartRevenue) { _chartRevenue.destroy(); _chartRevenue = null; }
+    const ctxRev = document.getElementById('chart-revenue');
+    if (ctxRev) {
+      _chartRevenue = new Chart(ctxRev, {
+        type: 'line',
+        data: {
+          labels: revenueData.map(r => r.month),
+          datasets: [{
+            label: 'Revenue Collected',
+            data: revenueData.map(r => r.amount),
+            borderColor: '#7c3aed',
+            backgroundColor: 'rgba(124,58,237,0.08)',
+            borderWidth: 2.5,
+            pointBackgroundColor: '#9155ff',
+            pointBorderColor: '#9155ff',
+            pointRadius: 5,
+            pointHoverRadius: 7,
+            tension: 0.4,
+            fill: true,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: 'rgba(15,15,26,0.95)',
+              titleColor: '#94a3b8',
+              bodyColor: '#f1f5f9',
+              borderColor: 'rgba(124,58,237,0.4)',
+              borderWidth: 1,
+              callbacks: { label: ctx => ' ' + formatCurrency(ctx.raw) }
+            }
+          },
+          scales: {
+            x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b', font: { size: 11 } } },
+            y: {
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              ticks: {
+                color: '#64748b',
+                font: { size: 11 },
+                callback: v => '₹' + (v >= 1000 ? (v/1000).toFixed(1) + 'k' : v)
+              },
+              beginAtZero: true
+            }
+          }
+        }
+      });
+    }
+
+    // ── Status donut chart (uses all-time paid count so it's never empty) ──
+    if (_chartStatus) { _chartStatus.destroy(); _chartStatus = null; }
+    const ctxStatus = document.getElementById('chart-status');
+    if (ctxStatus) {
+      // Use all-time paid count so the chart has data even if nothing paid this month
+      const paid    = data.paid_total_count || data.paid_count_this_month || 0;
+      const sent    = data.sent_count   || 0;
+      const overdue = data.overdue_count || 0;
+      const total   = paid + sent + overdue;
+
+      if (total === 0) {
+        // No invoices at all — show placeholder text
+        ctxStatus.style.display = 'none';
+        const msg = document.createElement('p');
+        msg.style.cssText = 'text-align:center;color:var(--text3);margin-top:40px;font-size:13px';
+        msg.textContent = 'No invoice data yet';
+        ctxStatus.parentNode.appendChild(msg);
+      } else {
+        ctxStatus.style.display = '';
+        _chartStatus = new Chart(ctxStatus, {
+          type: 'doughnut',
+          data: {
+            labels: ['Paid', 'Sent', 'Overdue'],
+            datasets: [{
+              data: [paid, sent, overdue],
+              backgroundColor: ['rgba(16,185,129,0.7)', 'rgba(59,130,246,0.7)', 'rgba(239,68,68,0.7)'],
+              borderColor:     ['#10b981', '#3b82f6', '#ef4444'],
+              borderWidth: 1.5,
+              hoverOffset: 8,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            cutout: '68%',
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: { color: '#94a3b8', padding: 14, font: { size: 12 } }
+              },
+              tooltip: {
+                backgroundColor: 'rgba(15,15,26,0.95)',
+                titleColor: '#94a3b8',
+                bodyColor: '#f1f5f9',
+                borderColor: 'rgba(255,255,255,0.08)',
+                borderWidth: 1,
+                callbacks: {
+                  label: ctx => ` ${ctx.label}: ${ctx.raw} (${Math.round(ctx.raw / total * 100)}%)`
+                }
+              }
+            }
+          }
+        });
+      }
+    }
+
+
+  } catch (e) {
+    console.error('Stats load failed:', e);
+    statIds.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+  }
+}
+
+/* ── Bootstrap ─────────────────────────────────────────────────────────── */
+checkAuthStatus();

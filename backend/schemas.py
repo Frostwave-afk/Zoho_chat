@@ -33,6 +33,10 @@ class SendInvoiceRequest(BaseModel):
 class ManualInvoiceApproveRequest(BaseModel):
     draft_id: str
     send_email: bool = False
+    # Optional overrides from the editable card
+    client_name:  Optional[str] = None
+    client_email: Optional[str] = None
+    line_items:   Optional[List["ManualInvoiceLineItem"]] = None
 
 
 # ── Internal data shapes ─────────────────────────────────────────────────────
@@ -141,9 +145,40 @@ class ChatResponse(BaseModel):
     drafts: Optional[List[DraftInvoice]] = None
     batch_draft: Optional[BatchDraft] = None
     manual_invoice_draft: Optional[ManualInvoiceDraft] = None
+    recurring_draft: Optional[RecurringConversation] = None
     invoices_created: Optional[List[CreatedInvoice]] = None
     payment_invoices: Optional[List[PaymentInvoice]] = None
     ambiguous_contacts: Optional[List[AmbiguousContact]] = None
+
+
+
+class RecurringConversation(BaseModel):
+    """Tracks state for the multi-step recurring invoice creation conversation."""
+    step: str = "client"           # client → amount → frequency → start_date → confirm
+    client_name: Optional[str] = None
+    client_email: Optional[str] = None
+    zoho_contact_id: Optional[str] = None
+    is_new_contact: bool = False
+    item_name: Optional[str] = None
+    task_description: Optional[str] = None
+    amount: Optional[float] = None
+    currency: str = "INR"
+    frequency: Optional[str] = None   # monthly | weekly | yearly | daily
+    start_date: Optional[str] = None  # YYYY-MM-DD
+    end_date: Optional[str] = None    # YYYY-MM-DD or None = no end
+
+
+class RecurringInvoiceInfo(BaseModel):
+    """A single active recurring invoice returned from Zoho."""
+    recurring_invoice_id: str
+    recurrence_name: str
+    customer_name: str
+    amount: float
+    currency_code: str = "INR"
+    recurrence_frequency: str   # monthly | weekly | yearly
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    status: str = "active"
 
 
 class AuthStatus(BaseModel):
