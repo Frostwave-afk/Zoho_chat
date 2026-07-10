@@ -7,9 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import get_db
 from backend.schemas import (
-    ChatRequest, ChatResponse, ApproveRequest, BatchApproveRequest, ManualInvoiceApproveRequest,
+    ChatRequest, ChatResponse, ApproveRequest, BatchApproveRequest, ManualInvoiceApproveRequest, PaymentApproveRequest,
+    EstimateApproveRequest, MultiEstimateActionRequest,
 )
-from backend.services.pipeline import process_chat, approve_draft, approve_batch, approve_manual_invoice
+from backend.services.pipeline import process_chat, approve_draft, approve_batch, approve_manual_invoice, approve_payment_record, approve_estimate_draft, multi_estimate_action
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -98,4 +99,38 @@ async def manual_approve(request: ManualInvoiceApproveRequest, db: AsyncSession 
         client_name=request.client_name,
         client_email=request.client_email,
         line_items=request.line_items,
+    )
+
+
+@router.post("/payment-approve", response_model=ChatResponse)
+async def payment_approve(request: PaymentApproveRequest, db: AsyncSession = Depends(get_db)):
+    return await approve_payment_record(
+        draft_id=request.draft_id,
+        overrides={
+            "amount": request.amount,
+            "payment_date": request.payment_date,
+            "payment_mode": request.payment_mode,
+        },
+        db=db,
+    )
+
+
+@router.post("/estimate-approve", response_model=ChatResponse)
+async def estimate_approve(request: EstimateApproveRequest, db: AsyncSession = Depends(get_db)):
+    return await approve_estimate_draft(
+        draft_id=request.draft_id,
+        send_email=request.send_email,
+        db=db,
+        client_name=request.client_name,
+        client_email=request.client_email,
+        line_items=request.line_items,
+    )
+
+
+@router.post("/multi-estimate-action", response_model=ChatResponse)
+async def multi_estimate_action_endpoint(request: MultiEstimateActionRequest, db: AsyncSession = Depends(get_db)):
+    return await multi_estimate_action(
+        estimate_ids=request.estimate_ids,
+        mode=request.mode,
+        db=db,
     )

@@ -40,6 +40,8 @@ from backend.services.pipeline import (
     get_pending_batch,
     get_pending_manual_invoice,
     approve_manual_invoice,
+    get_pending_estimate,
+    approve_estimate_draft,
 )
 from backend.config import get_settings
 
@@ -195,6 +197,17 @@ def _render_draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _render_payment_draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✓ Confirm Payment", callback_data=f"pa:approve:{draft_id}"),
+        ],
+        [
+            InlineKeyboardButton("✗ Discard", callback_data=f"pa:discard:{draft_id}"),
+        ],
+    ])
+
+
 def _get_batch_selection(context: ContextTypes.DEFAULT_TYPE, batch_id: str, item_ids: Iterable[str]) -> list[str]:
     selections = context.user_data.setdefault("batch_selections", {})
     valid_ids = list(item_ids)
@@ -266,6 +279,36 @@ def _render_manual_invoice_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _render_estimate_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✓ Create Estimate", callback_data=f"me:{draft_id}:0"),
+            InlineKeyboardButton("📧 Create & Send", callback_data=f"me:{draft_id}:1"),
+        ],
+        [
+            InlineKeyboardButton("✗ Discard", callback_data=f"med:{draft_id}"),
+        ],
+    ])
+
+
+def _format_estimate_message(draft) -> str:
+    lines = ["📄 <b>Estimate Draft</b>\n"]
+    if draft.client_name:
+        lines.append(f"👤 <b>Client:</b> {_e(draft.client_name)}")
+    if draft.client_email:
+        lines.append(f"📧 <b>Email:</b> {_e(draft.client_email)}")
+        
+    lines.append("\n<b>Line Items:</b>")
+    for idx, item in enumerate(draft.line_items):
+        lines.append(f"  {idx + 1}. <b>{_e(item.item_name)}</b> — {draft.currency} {item.amount:,.2f}")
+        if item.description:
+            lines.append(f"     <i>{_e(item.description)}</i>")
+            
+    total = sum(item.amount for item in draft.line_items)
+    lines.append(f"\n💰 <b>Total Amount:</b> {draft.currency} {total:,.2f}")
+    return "\n".join(lines)
+
+
 def _format_draft_message(draft) -> str:
     d = draft.data
     lines = ["🧾 <b>Draft Invoice</b>\n"]
@@ -331,6 +374,18 @@ def _format_created_invoices(invoices) -> str:
             f"✅ Invoice <b>#{_e(inv.invoice_number)}</b> — "
             f"{_e(inv.client_name)} — "
             f"{_e(inv.currency)} {inv.amount:,.2f}{sent_str}"
+        )
+    return "\n".join(lines)
+
+
+def _format_created_estimates(estimates) -> str:
+    lines = []
+    for est in estimates:
+        sent_str = " 📧 sent" if est.email_sent else ""
+        lines.append(
+            f"✅ Estimate <b>#{_e(est.estimate_number)}</b> — "
+            f"{_e(est.client_name)} — "
+            f"{_e(est.currency)} {est.amount:,.2f}{sent_str}"
         )
     return "\n".join(lines)
 
@@ -464,7 +519,7 @@ async def _run_chat_flow(
         pass
 
     # ── Reply text ────────────────────────────────────────────────────────────
-    if response.action not in ("recurring_pending", "recurring_list"):
+    if response.action not in ("recurring_pending", "recurring_list", "payment_record_pending", "estimate_pending", "estimate_created"):
         await update.message.reply_text(_md_safe(response.reply), parse_mode=ParseMode.HTML)
 
     # ── Payment invoice cards ─────────────────────────────────────────────────
@@ -477,6 +532,11 @@ async def _run_chat_flow(
     if response.invoices_created:
         inv_text = _format_created_invoices(response.invoices_created)
         await update.message.reply_text(inv_text, parse_mode=ParseMode.HTML)
+
+    # ── Created estimate cards ────────────────────────────────────────────────
+    if response.estimates_created:
+        est_text = _format_created_estimates(response.estimates_created)
+        await update.message.reply_text(est_text, parse_mode=ParseMode.HTML)
 
     # ── Draft cards ───────────────────────────────────────────────────────────
     if response.drafts:
@@ -508,6 +568,22 @@ async def _run_chat_flow(
             _format_manual_invoice_message(draft),
             parse_mode=ParseMode.HTML,
             reply_markup=_render_manual_invoice_keyboard(draft.draft_id),
+        )
+
+    if response.estimate_draft:
+        draft = response.estimate_draft
+        await update.message.reply_text(
+            _format_estimate_message(draft),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_render_estimate_keyboard(draft.draft_id),
+        )
+
+    if response.payment_record_draft:
+        draft = response.payment_record_draft
+        await update.message.reply_text(
+            _md_safe(response.reply),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_render_payment_draft_keyboard(draft.draft_id),
         )
 
     # ── Recurring invoice: confirm card (pending) ─────────────────────────────
@@ -637,6 +713,47 @@ async def cmd_stop_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE)
     args_text = " ".join(context.args).strip()
     prompt = f"stop recurring {args_text}" if args_text else "stop recurring invoice"
     await _run_chat_flow(update, context, prompt)
+
+
+async def cmd_remind_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send payment reminders for overdue invoices.
+
+    Usage:
+        /remind_overdue              — remind all overdue invoices (>=0 days)
+        /remind_overdue 14           — remind all >14 days overdue
+        /remind_overdue Vismay       — remind only Vismay's overdue invoices
+        /remind_overdue 14 Vismay    — 14-day threshold for Vismay specifically
+    """
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text(_not_allowed_reply())
+        return
+
+    args_text = " ".join(context.args).strip()
+    if args_text:
+        # Build a natural-language prompt so process_chat's intent parser handles it
+        prompt = f"send reminder for overdue {args_text}"
+        await _run_chat_flow(update, context, prompt)
+    else:
+        # Prompt user for more detail
+        _set_pending_command_input(
+            context,
+            "remind_overdue",
+            "Tell me who or how many days for `/remind_overdue`.",
+        )
+        await update.message.reply_text(
+            "\ud83d\udce7 *Send overdue payment reminders*\n\n"
+            "Options:\n"
+            "\u2022 Send all overdue invoices: just type `all`\n"
+            "\u2022 Type a *client name* to remind only them (e.g. `Vismay`)\n"
+            "\u2022 Type a *number of days* threshold (e.g. `14`)\n"
+            "\u2022 Or combine both: `14 Vismay`\n\n"
+            "You can also type /cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        return
+
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -837,6 +954,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
         return
 
+    if data.startswith("me:"):
+        _, draft_id, send_flag = data.split(":")
+        draft = get_pending_estimate(draft_id)
+        if not draft:
+            await query.edit_message_text(
+                "This estimate draft has expired or was already processed.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        send_email = send_flag == "1"
+        await query.edit_message_text("⏳ Creating estimate…")
+
+        async with AsyncSessionLocal() as db:
+            response = await approve_estimate_draft(
+                draft_id=draft_id,
+                send_email=send_email,
+                db=db,
+            )
+
+        result_text = _md_safe(response.reply)
+        if response.estimates_created:
+            result_text += "\n\n" + _format_created_estimates(response.estimates_created)
+        await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("med:"):
+        _, draft_id = data.split(":")
+        from backend.services.pipeline import _pending_estimate_drafts
+        _pending_estimate_drafts.pop(draft_id, None)
+        await query.edit_message_text("🗑️ Estimate draft discarded.", parse_mode=ParseMode.HTML)
+        return
+
+    # ── Record payment callback ───────────────────────────────────────────────
+    if data.startswith("pa:"):
+        _, action_type, draft_id = data.split(":")
+        if action_type == "discard":
+            from backend.services.pipeline import _pending_payment_drafts
+            _pending_payment_drafts.pop(draft_id, None)
+            await query.edit_message_text("🗑️ Payment draft discarded.", parse_mode=ParseMode.HTML)
+            return
+
+        if action_type == "approve":
+            await query.edit_message_text("⏳ Recording payment in Zoho…")
+            from backend.services.pipeline import approve_payment_record
+            async with AsyncSessionLocal() as db:
+                response = await approve_payment_record(
+                    draft_id=draft_id,
+                    overrides={},
+                    db=db,
+                )
+            result_text = _md_safe(response.reply)
+            await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
+            return
+
     # ── Recurring: confirm create ─────────────────────────────────────────────
     if data.startswith("confirm_recurring:"):
         await query.edit_message_text("⏳ Creating recurring invoice…")
@@ -894,6 +1066,7 @@ async def post_init(application: Application) -> None:
         BotCommand("get_mails",         "Scan emails for a timeframe like today or last week"),
         BotCommand("payment_status",    "Show overall payment summary and status"),
         BotCommand("payment_status_of", "Check payment status of one client"),
+        BotCommand("remind_overdue",    "Send payment reminders to overdue clients"),
         BotCommand("recurring",         "Create a recurring invoice"),
         BotCommand("list_recurring",    "List all active recurring invoices"),
         BotCommand("stop_recurring",    "Stop one or more recurring invoices"),
@@ -945,6 +1118,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("get_mails",         cmd_get_mails))
     app.add_handler(CommandHandler("payment_status",    cmd_payment_status))
     app.add_handler(CommandHandler("payment_status_of", cmd_payment_status_of))
+    app.add_handler(CommandHandler("remind_overdue",    cmd_remind_overdue))
     app.add_handler(CommandHandler("recurring",         cmd_recurring))
     app.add_handler(CommandHandler("list_recurring",    cmd_list_recurring))
     app.add_handler(CommandHandler("stop_recurring",    cmd_stop_recurring))

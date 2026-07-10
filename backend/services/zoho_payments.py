@@ -9,7 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
-from backend.db.models import InvoiceCache
+from backend.db.models import InvoiceCache, RecurringCache
 from backend.services.zoho_service import _headers, _invoice_url, get_org_id
 
 logger = logging.getLogger(__name__)
@@ -29,12 +29,12 @@ _STATUS_ALIASES: dict[str, str] = {
 }
 
 
-def _normalize_status(raw: str, fallback: str) -> str:
+def normalize_status(raw: str, fallback: str) -> str:
     s = (raw or fallback).strip().lower()
     return _STATUS_ALIASES.get(s, s)
 
 
-def _parse_due_date(raw: Optional[str]) -> Optional[date]:
+def parse_due_date(raw: Optional[str]) -> Optional[date]:
     if not raw:
         return None
     try:
@@ -50,15 +50,18 @@ def _row_to_dict(row: InvoiceCache) -> dict:
         days_overdue = max(0, (date.today() - due).days)
 
     return {
-        "invoice_id":    row.invoice_id,
-        "customer_name": row.customer_name,
-        "status":        row.status,
-        "due_date":      due.isoformat() if due else None,
-        "balance":       float(row.balance or 0),
-        "total":         float(row.total or 0),
-        "currency_code": row.currency_code or "INR",
-        "zoho_view_url": row.zoho_view_url,
-        "days_overdue":  days_overdue,
+        "invoice_id":      row.invoice_id,
+        "customer_name":   row.customer_name,
+        "status":          row.status,
+        "due_date":        due.isoformat() if due else None,
+        "invoice_date":    row.invoice_date.isoformat() if row.invoice_date else None,
+        "last_payment_date": row.last_payment_date.isoformat() if row.last_payment_date else None,
+        "balance":         float(row.balance or 0),
+        "total":           float(row.total or 0),
+        "currency_code":   row.currency_code or "INR",
+        "zoho_view_url":   row.zoho_view_url,
+        "days_overdue":    days_overdue,
+        "last_reminded_at": row.last_reminded_at,   # epoch seconds or None
     }
 
 
@@ -93,6 +96,7 @@ async def _fetch_invoices_by_status(db: AsyncSession, status: str) -> list[dict]
 
 async def sync_invoices_from_zoho(db: AsyncSession) -> int:
     """Fetch ALL relevant invoices from Zoho and replace the local cache.
+    Also fetches active recurring profiles and caches them in RecurringCache.
     Returns the number of rows stored.
     """
     now = int(time.time())
@@ -115,25 +119,81 @@ async def sync_invoices_from_zoho(db: AsyncSession) -> int:
                 continue
             seen.add(invoice_id)
 
+            due_date = parse_due_date(inv.get("due_date"))
+            balance  = Decimal(str(inv.get("balance") or 0))
+            status   = normalize_status(inv.get("status", ""), status)
+            if status in ("sent", "partially_paid", "unpaid") and balance > 0 and due_date and due_date < date.today():
+                status = "overdue"
+
             rows.append(InvoiceCache(
                 invoice_id=invoice_id,
                 customer_name=inv.get("customer_name") or "Unknown",
-                # Normalize status variants (e.g. "partial" → "partially_paid")
-                status=_normalize_status(inv.get("status", ""), status),
-                due_date=_parse_due_date(inv.get("due_date")),
-                balance=Decimal(str(inv.get("balance") or 0)),
+                status=status,
+                due_date=due_date,
+                invoice_date=parse_due_date(inv.get("date") or inv.get("invoice_date")),
+                last_payment_date=parse_due_date(inv.get("last_payment_date") or None),
+                balance=balance,
                 total=Decimal(str(inv.get("total") or 0)),
                 currency_code=inv.get("currency_code") or "INR",
                 zoho_view_url=_invoice_url(invoice_id),
                 last_synced=now,
             ))
 
+    # Fetch active recurring profiles from Zoho
+    recurring_rows: list[RecurringCache] = []
+    try:
+        org_id = await get_org_id(db)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{settings.zoho_api_base}/recurringinvoices",
+                headers=await _headers(db),
+                params={
+                    "organization_id": org_id,
+                    "filter_by": "Status.Active",
+                    "per_page": 200,
+                },
+            )
+            resp.raise_for_status()
+            rec_data = resp.json().get("recurring_invoices", [])
+            for rec in rec_data:
+                profile_id = str(rec.get("recurring_invoice_id") or "")
+                if profile_id:
+                    recurring_rows.append(RecurringCache(
+                        profile_id=profile_id,
+                        customer_name=rec.get("customer_name") or "Unknown",
+                        status="active",
+                        amount=Decimal(str(rec.get("total") or 0.0)),
+                        last_synced=now,
+                    ))
+    except Exception as e:
+        logger.error(f"Failed to sync recurring invoices from Zoho: {e}")
+
+    # Snapshot existing last_reminded_at before clearing the table so that
+    # reminder cooldowns are preserved across cache resyncs.
+    existing_reminded: dict[str, int | None] = {}
+    try:
+        existing_result = await db.execute(
+            select(InvoiceCache.invoice_id, InvoiceCache.last_reminded_at)
+        )
+        for inv_id, reminded_at in existing_result:
+            existing_reminded[inv_id] = reminded_at
+    except Exception:
+        pass  # table might not exist yet on first run — safe to skip
+
+    # Update database cache tables
     await db.execute(delete(InvoiceCache))
     for row in rows:
+        # Restore last_reminded_at from the pre-wipe snapshot
+        row.last_reminded_at = existing_reminded.get(row.invoice_id)
         db.add(row)
+
+    await db.execute(delete(RecurringCache))
+    for r_row in recurring_rows:
+        db.add(r_row)
+
     await db.commit()
 
-    logger.info(f"Invoice cache synced — {len(rows)} invoice(s) from Zoho.")
+    logger.info(f"Invoice cache synced — {len(rows)} invoice(s) and {len(recurring_rows)} recurring profile(s) from Zoho.")
     return len(rows)
 
 

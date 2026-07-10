@@ -39,8 +39,23 @@ class InvoiceCache(Base):
     customer_name = Column(String(255), nullable=False)
     status = Column(String(50), nullable=False)
     due_date = Column(Date, nullable=True)
+    invoice_date = Column(Date, nullable=True)
+    last_payment_date = Column(Date, nullable=True)
     balance = Column(Numeric(12, 2), nullable=False, default=0)
     total = Column(Numeric(12, 2), nullable=False, default=0)
     currency_code = Column(String(10), nullable=False, default="INR")
     zoho_view_url = Column(Text, nullable=True)
     last_synced = Column(BigInteger, nullable=False)
+    last_reminded_at = Column(BigInteger, nullable=True)
+
+
+class RecurringCache(Base):
+    """Zoho active recurring profile snapshot for stats and status displays."""
+    __tablename__ = "recurring_cache"
+
+    profile_id = Column(String(255), primary_key=True)
+    customer_name = Column(String(255), nullable=False)
+    status = Column(String(50), nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False, default=0)
+    last_synced = Column(BigInteger, nullable=False)
+

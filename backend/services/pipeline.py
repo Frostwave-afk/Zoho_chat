@@ -1,19 +1,24 @@
 import uuid
 import asyncio
+import httpx
 import logging
 from collections import deque
 from email.utils import parseaddr
 from typing import Optional
 import re
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from backend.config import get_settings
+
+settings = get_settings()
 
 from backend.schemas import (
     ChatResponse, DraftInvoice, CreatedInvoice, PaymentInvoice,
     AmbiguousContact, InvoiceData, ApproveRequest, BatchDraft, BatchDraftItem,
     ManualInvoiceConversation, ManualInvoiceDraft, ManualInvoiceLineItem,
-    RecurringConversation, RecurringInvoiceInfo,
+    RecurringConversation, RecurringInvoiceInfo, PaymentRecordDraft,
+    EstimateDraft, EstimateLineItem, CreatedEstimate, AmbiguousEstimate, EstimateApproveRequest,
 )
 from backend.services.groq_service import parse_intent, extract_manual_invoice_request, extract_recurring_details
 from backend.services.gemini_service import extract_invoice_data
@@ -30,6 +35,10 @@ from backend.services.zoho_service import (
     mark_email_processed, send_invoice_email, update_contact_email,
     clear_org_id_cache,
     create_recurring_invoice, list_recurring_invoices, stop_recurring_invoice,
+    bulk_remind_invoices, record_payment,
+    create_estimate, send_estimate_email, convert_estimate_to_invoice,
+    list_estimates, get_estimate, update_estimate_status,
+    _headers, get_org_id, _ZOHO_APP_BASE,
 )
 from backend.db.models import OAuthToken, ProcessedEmail, ContactCache, InvoiceCache
 
@@ -172,11 +181,19 @@ def _message_supports_manual_invoice_payload(message: str, parsed: dict) -> bool
 _pending_drafts: dict[str, DraftInvoice] = {}
 _pending_batches: dict[str, BatchDraft] = {}
 _pending_manual_invoice_drafts: dict[str, ManualInvoiceDraft] = {}
+_pending_estimate_drafts: dict[str, EstimateDraft] = {}
 _manual_invoice_conversation: Optional[ManualInvoiceConversation] = None
+_pending_payment_drafts: dict[str, PaymentRecordDraft] = {}
+_pending_payment_disambiguations: dict[str | int, dict] = {}
+_pending_estimate_disambiguations: dict[str | int, dict] = {}
+_pending_payment_customer_prompts: dict[str | int, dict] = {}
 
 # Tracks the last N invoices created this session so the user can say
 # "send the invoice just created" or "send all invoices created today"
 _recent_invoices: deque[CreatedInvoice] = deque(maxlen=20)
+
+# Tracks estimates created/accepted this session for accept/send flows
+_recent_estimates: deque[CreatedEstimate] = deque(maxlen=20)
 
 
 def get_pending_draft(draft_id: str) -> Optional[DraftInvoice]:
@@ -192,6 +209,12 @@ def get_recent_invoices() -> list[CreatedInvoice]:
 
 def get_pending_manual_invoice(draft_id: str) -> Optional[ManualInvoiceDraft]:
     return _pending_manual_invoice_drafts.get(draft_id)
+
+def get_pending_estimate(draft_id: str) -> Optional[EstimateDraft]:
+    return _pending_estimate_drafts.get(draft_id)
+
+def get_pending_payment_draft(draft_id: str) -> Optional[PaymentRecordDraft]:
+    return _pending_payment_drafts.get(draft_id)
 
 
 def _parse_amount_and_currency(text: str) -> tuple[Optional[float], Optional[str]]:
@@ -288,6 +311,28 @@ def _build_manual_invoice_draft_from_state(state: ManualInvoiceConversation) -> 
     return draft
 
 
+def _build_estimate_draft_from_state(state: ManualInvoiceConversation) -> EstimateDraft:
+    draft_id = str(uuid.uuid4())
+    line_items = []
+    for item in state.line_items:
+        line_items.append(EstimateLineItem(
+            item_name=item.item_name,
+            description=item.task_description,
+            amount=item.amount,
+        ))
+    draft = EstimateDraft(
+        draft_id=draft_id,
+        client_name=state.client_name or "Unknown",
+        client_email=state.client_email,
+        currency=state.currency or "INR",
+        zoho_contact_id=state.zoho_contact_id,
+        is_new_contact=state.is_new_contact,
+        line_items=line_items,
+    )
+    _pending_estimate_drafts[draft_id] = draft
+    return draft
+
+
 def _manual_invoice_summary(draft: ManualInvoiceDraft) -> str:
     total = sum(item.amount for item in draft.line_items)
     lines = [f"Here's the manual invoice draft for **{draft.client_name}**:"]
@@ -306,6 +351,121 @@ def _manual_invoice_summary(draft: ManualInvoiceDraft) -> str:
     return "\n".join(lines)
 
 
+def _estimate_summary(draft: EstimateDraft) -> str:
+    total = sum(item.amount for item in draft.line_items)
+    lines = [f"Here's the estimate draft for **{draft.client_name}**:"]
+    if draft.client_email:
+        lines.append(f"Email: **{draft.client_email}**")
+    if draft.is_new_contact:
+        lines.append("This customer will be created in Zoho when you approve it.")
+    lines.append("")
+    for idx, item in enumerate(draft.line_items, 1):
+        lines.append(
+            f"{idx}. **{item.item_name}** — {draft.currency} {item.amount:,.2f}\n"
+            f"   {item.description}"
+        )
+    lines.append(f"\nTotal: **{draft.currency} {total:,.2f}**")
+    lines.append("Approve it below when you're happy with it.")
+    return "\n".join(lines)
+
+
+async def _advance_manual_invoice_conversation(db: AsyncSession) -> ChatResponse:
+    global _manual_invoice_conversation
+    state = _manual_invoice_conversation
+    if not state:
+        return ChatResponse(reply="Invoice/Estimate creation cancelled.", action="clarification_needed")
+
+    noun = "estimate" if state.is_estimate else "invoice"
+    verb = "quote" if state.is_estimate else "invoice"
+
+    # 1. Check if client name is missing
+    if not state.client_name:
+        state.step = "awaiting_customer"
+        return ChatResponse(
+            reply=f"👤 Who is this {noun} for? (Enter name, or name + email for a new client)",
+            action="clarification_needed",
+        )
+
+    # 2. Resolve customer details if not already done
+    if not state.zoho_contact_id and not state.client_email:
+        name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
+            state.client_name, state.client_email, db
+        )
+        state.client_name = name or state.client_name
+        state.client_email = email or state.client_email
+        state.zoho_contact_id = contact_id
+        state.is_new_contact = is_new
+
+        if clarification:
+            if state.is_estimate:
+                clarification = clarification.replace("invoice", "estimate")
+            if is_new and not state.client_email:
+                state.step = "awaiting_customer_email"
+                return ChatResponse(reply=clarification, action="clarification_needed")
+            state.step = "awaiting_customer"
+            return ChatResponse(reply=clarification, action="clarification_needed")
+
+    # 3. Check if new customer requires an email address
+    if state.is_new_contact and not state.client_email:
+        state.step = "awaiting_customer_email"
+        return ChatResponse(
+            reply=f"I couldn't find **{state.client_name}** in Zoho. Send their email address and I'll create them as a new customer (or type **skip** to continue without one).",
+            action="clarification_needed",
+        )
+
+    # 4. Check if service/item name is missing
+    if not state.pending_item_name:
+        state.step = "awaiting_service_name"
+        return ChatResponse(
+            reply=f"📦 What service or work should I {verb} **{state.client_name}** for?",
+            action="clarification_needed",
+        )
+
+    # 5. Check if amount is missing
+    if state.pending_item_amount is None:
+        state.step = "awaiting_item_amount"
+        return ChatResponse(
+            reply=f"💰 What's the amount for **{state.pending_item_name}**? (e.g. ₹5,000)",
+            action="clarification_needed",
+        )
+
+    # 6. All fields satisfied! Instantiate ManualInvoiceLineItem, append to line_items and clear pending
+    if not state.line_items:
+        title_name = state.pending_item_name.strip().title()
+        desc = state.pending_item_description or f"{title_name} Services"
+        
+        state.line_items = [
+            ManualInvoiceLineItem(
+                item_name=title_name,
+                task_description=desc,
+                amount=state.pending_item_amount
+            )
+        ]
+        state.item_count = 1
+        
+    state.pending_item_name = None
+    state.pending_item_description = None
+    state.pending_item_amount = None
+
+    # 7. Complete: build the manual draft/estimate draft card and reset state
+    if state.is_estimate:
+        draft = _build_estimate_draft_from_state(state)
+        _manual_invoice_conversation = None
+        return ChatResponse(
+            reply=_estimate_summary(draft),
+            action="estimate_pending",
+            estimate_draft=draft,
+        )
+    else:
+        draft = _build_manual_invoice_draft_from_state(state)
+        _manual_invoice_conversation = None
+        return ChatResponse(
+            reply=_manual_invoice_summary(draft),
+            action="manual_invoice_pending",
+            manual_invoice_draft=draft,
+        )
+
+
 async def _handle_manual_invoice_conversation(
     message: str,
     db: AsyncSession,
@@ -317,67 +477,27 @@ async def _handle_manual_invoice_conversation(
 
     text = (message or "").strip()
 
+    # Cancel check
+    clean_text = text.lower().strip(" .!?")
+    if any(c in clean_text for c in ("cancel", "stop", "discard", "abort", "nevermind", "never mind", "cacell")):
+        doc_type = "Estimate" if state.is_estimate else "Invoice"
+        _manual_invoice_conversation = None
+        return ChatResponse(
+            reply=f"{doc_type} creation cancelled. Flow stopped.",
+            action="clarification_needed",
+        )
+
     if state.step == "awaiting_customer":
-        parsed = await extract_manual_invoice_request(text)
-        if not _message_supports_manual_invoice_payload(text, parsed):
-            parsed = {
-                "currency": None,
-                "send_email": None,
-                "items": [],
-            }
-        
-        # When waiting for a customer name, the text itself is the proposed name.
-        # We also attempt to extract an email if the user provided one in the same message.
         proposed_name = text
         proposed_email = None
         email_match = _EMAIL_RE.search(text)
         if email_match:
             proposed_email = email_match.group()
             proposed_name = text.replace(proposed_email, "").strip()
-        name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
-            proposed_name,
-            proposed_email,
-            db,
-        )
-        state.client_name = name
-        state.client_email = email
-        state.zoho_contact_id = contact_id
-        state.is_new_contact = is_new
-        if clarification:
-            if is_new and not email:
-                state.step = "awaiting_customer_email"
-            return ChatResponse(reply=clarification, action="clarification_needed")
 
-        if parsed.get("currency"):
-            state.currency = parsed["currency"]
-        parsed_items = [
-            ManualInvoiceLineItem(**item)
-            for item in (parsed.get("items") or [])
-            if item.get("item_name") and item.get("task_description") and item.get("amount") is not None
-        ]
-        if parsed_items:
-            state.line_items = parsed_items
-            state.item_count = len(parsed_items)
-            state.send_email = parsed.get("send_email")
-            if state.send_email is None:
-                state.step = "awaiting_send_choice"
-                return ChatResponse(
-                    reply="Should I send the invoice email after creating it? Reply with `yes` or `no`.",
-                    action="clarification_needed",
-                )
-            draft = _build_manual_invoice_draft_from_state(state)
-            _manual_invoice_conversation = None
-            return ChatResponse(
-                reply=_manual_invoice_summary(draft),
-                action="manual_invoice_pending",
-                manual_invoice_draft=draft,
-            )
-
-        state.step = "awaiting_service_name"
-        return ChatResponse(
-            reply=f"📦 What service or work should I invoice **{state.client_name}** for?",
-            action="clarification_needed",
-        )
+        state.client_name = proposed_name
+        state.client_email = proposed_email
+        return await _advance_manual_invoice_conversation(db)
 
     if state.step == "awaiting_customer_email":
         if text.lower().strip() in ("skip", "none", "no email"):
@@ -390,82 +510,14 @@ async def _handle_manual_invoice_conversation(
                     action="clarification_needed",
                 )
         state.client_email = email
-        state.is_new_contact = True
-        state.step = "awaiting_service_name"
-        return ChatResponse(
-            reply=f"📦 What service or work should I invoice **{state.client_name}** for?",
-            action="clarification_needed",
-        )
+        state.zoho_contact_id = None  # force re-check
+        return await _advance_manual_invoice_conversation(db)
 
-    # ── NEW: clean service → amount → confirm flow ─────────────────────────
     if state.step == "awaiting_service_name":
-        state.pending_item_name = text
-        state.step = "awaiting_item_amount"
-        return ChatResponse(
-            reply=f"💰 What's the amount? (e.g. **₹5,000** or **$500**)",
-            action="clarification_needed",
-        )
-
-    if state.step == "awaiting_item_count":
-        parsed = await extract_manual_invoice_request(text)
-        if not _message_supports_manual_invoice_payload(text, parsed):
-            parsed = {
-                "client_name": None,
-                "client_email": None,
-                "currency": None,
-                "send_email": None,
-                "items": [],
-            }
-        parsed_items = [
-            ManualInvoiceLineItem(**item)
-            for item in (parsed.get("items") or [])
-            if item.get("item_name") and item.get("task_description") and item.get("amount") is not None
-        ]
-        if parsed_items:
-            state.line_items = parsed_items
-            state.item_count = len(parsed_items)
-            if parsed.get("currency"):
-                state.currency = parsed["currency"]
-            state.send_email = parsed.get("send_email")
-            if state.send_email is None:
-                state.step = "awaiting_send_choice"
-                return ChatResponse(
-                    reply="Nice. Should I send the invoice email after creating it? Reply with `yes` or `no`.",
-                    action="clarification_needed",
-                )
-            draft = _build_manual_invoice_draft_from_state(state)
-            _manual_invoice_conversation = None
-            return ChatResponse(
-                reply=_manual_invoice_summary(draft),
-                action="manual_invoice_pending",
-                manual_invoice_draft=draft,
-            )
-
-        count_match = re.search(r"\d+", text)
-        if not count_match:
-            return ChatResponse(
-                reply="Tell me the number of line items, like `1`, `2`, or `3`.",
-                action="clarification_needed",
-            )
-        state.item_count = max(1, int(count_match.group()))
-        state.step = "awaiting_item_name"
-        return ChatResponse(reply="What's the name of item 1?", action="clarification_needed")
-
-    if state.step == "awaiting_item_name":
-        state.pending_item_name = text
-        state.step = "awaiting_item_description"
-        return ChatResponse(
-            reply=f"Got it. What's the description for **{state.pending_item_name}**?",
-            action="clarification_needed",
-        )
-
-    if state.step == "awaiting_item_description":
-        state.pending_item_description = text
-        state.step = "awaiting_item_amount"
-        return ChatResponse(
-            reply=f"And what's the price for **{state.pending_item_name}**?",
-            action="clarification_needed",
-        )
+        item_name = text.strip()
+        state.pending_item_name = item_name
+        state.pending_item_description = f"{item_name} Services"
+        return await _advance_manual_invoice_conversation(db)
 
     if state.step == "awaiting_item_amount":
         amount, currency = _parse_amount_and_currency(text)
@@ -476,43 +528,8 @@ async def _handle_manual_invoice_conversation(
             )
         if currency:
             state.currency = currency
-
-        # Auto-format the item name: title-case it properly
-        raw_name = (state.pending_item_name or "Service").strip()
-        item_name = raw_name.title()
-
-        # Generate a clean description if none was set
-        description = (state.pending_item_description or "").strip()
-        if not description:
-            # e.g. "website redesign" → "Website Redesign Services"
-            description = item_name if item_name.endswith("s") else f"{item_name} Services"
-
-        state.line_items.append(
-            ManualInvoiceLineItem(
-                item_name=item_name,
-                task_description=description,
-                amount=amount,
-            )
-        )
-        state.pending_item_name = None
-        state.pending_item_description = None
-
-        # If more items needed (old multi-item flow), continue collecting
-        if len(state.line_items) < state.item_count:
-            next_idx = len(state.line_items) + 1
-            state.step = "awaiting_item_name"
-            return ChatResponse(reply=f"What's the name of item {next_idx}?", action="clarification_needed")
-
-        # All items collected — show draft card immediately (no yes/no needed)
-        draft = _build_manual_invoice_draft_from_state(state)
-        _manual_invoice_conversation = None
-        return ChatResponse(
-            reply=_manual_invoice_summary(draft),
-            action="manual_invoice_pending",
-            manual_invoice_draft=draft,
-        )
-
-    # awaiting_send_choice is removed — drafts go straight to card now
+        state.pending_item_amount = amount
+        return await _advance_manual_invoice_conversation(db)
 
     return None
 
@@ -526,7 +543,13 @@ async def clear_session_state(db: AsyncSession) -> None:
     _pending_drafts.clear()
     _pending_batches.clear()
     _pending_manual_invoice_drafts.clear()
+    _pending_estimate_drafts.clear()
+    _pending_payment_drafts.clear()
+    _pending_payment_disambiguations.clear()
+    _pending_estimate_disambiguations.clear()
+    _pending_payment_customer_prompts.clear()
     _recent_invoices.clear()
+    _recent_estimates.clear()
     _manual_invoice_conversation = None
     clear_org_id_cache()          # force fresh org-ID fetch on next Zoho call
 
@@ -565,12 +588,18 @@ async def _handle_payment_query(
     except RuntimeError as e:
         return ChatResponse(reply=str(e), action="error")
 
+    if action == "payment_summary" and person_name:
+        action = "check_specific_payment"
+
     if action == "check_overdue":
         rows = await get_overdue(db)
+        if person_name:
+            p_lower = person_name.lower().strip()
+            rows = [r for r in rows if p_lower in r.get("customer_name", "").lower()]
         reply = format_payment_response(
             rows,
-            title="**Overdue invoices** (oldest first):",
-            empty_message="Good news — you have no overdue invoices right now. ✅",
+            title=f"**Overdue invoices for {person_name}:**" if person_name else "**Overdue invoices** (oldest first):",
+            empty_message=f"Good news — **{person_name}** has no overdue invoices right now. ✅" if person_name else "Good news — you have no overdue invoices right now. ✅",
         )
         return ChatResponse(reply=reply, action="payment_status", payment_invoices=_payment_invoices(rows))
 
@@ -578,10 +607,13 @@ async def _handle_payment_query(
         overdue_rows = await get_overdue(db)
         pending_rows = await get_pending(db)
         rows = overdue_rows + pending_rows
+        if person_name:
+            p_lower = person_name.lower().strip()
+            rows = [r for r in rows if p_lower in r.get("customer_name", "").lower()]
         reply = format_payment_response(
             rows,
-            title="**Unpaid invoices:**",
-            empty_message="No unpaid invoices — everything has been paid. ✅",
+            title=f"**Unpaid invoices for {person_name}:**" if person_name else "**Unpaid invoices:**",
+            empty_message=f"No unpaid invoices for **{person_name}** — everything has been paid. ✅" if person_name else "No unpaid invoices — everything has been paid. ✅",
         )
         return ChatResponse(reply=reply, action="payment_status", payment_invoices=_payment_invoices(rows))
 
@@ -604,6 +636,340 @@ async def _handle_payment_query(
         return ChatResponse(reply=reply, action="payment_status", payment_invoices=cards or None)
 
     return ChatResponse(reply="Unknown payment query.", action="error")
+
+
+async def _handle_remind_overdue(
+    person_name: Optional[str],
+    days_overdue_min: int,
+    db: AsyncSession,
+    emit=None,
+) -> ChatResponse:
+    """Send payment reminders to overdue clients, with 5-day spam cooldown."""
+    import time
+    import math
+    from sqlalchemy import update as sa_update
+
+    _emit = emit or (lambda _: None)
+    await _emit("🔄 Syncing fresh data from Zoho before sending reminders…")
+    try:
+        await ensure_fresh_cache(db, force=True)
+    except RuntimeError as e:
+        return ChatResponse(reply=str(e), action="error")
+
+    all_overdue = await get_overdue(db)
+
+    # Step 1 — filter by days_overdue threshold AND optional client_name
+    p_lower = person_name.lower().strip() if person_name else None
+    criteria_match = [
+        r for r in all_overdue
+        if (r.get("days_overdue") or 0) >= days_overdue_min
+        and (p_lower is None or p_lower in r.get("customer_name", "").lower())
+    ]
+
+    # Case A: Nothing matches the basic overdue threshold / client filter
+    if not criteria_match:
+        if person_name:
+            return ChatResponse(
+                reply=f"No overdue invoices found for **{person_name}** that are "
+                      f">= {days_overdue_min} days overdue. ✅",
+                action="payment_status",
+            )
+        return ChatResponse(
+            reply=f"No overdue invoices >= {days_overdue_min} days overdue right now. ✅",
+            action="payment_status",
+        )
+
+    # Step 2 — apply 5-day cooldown filter
+    cooldown_secs = 5 * 24 * 3600
+    now_ts = time.time()
+    eligible = [
+        r for r in criteria_match
+        if r.get("last_reminded_at") is None
+        or r["last_reminded_at"] < now_ts - cooldown_secs
+    ]
+    on_cooldown = [r for r in criteria_match if r not in eligible]
+
+    # Case B: All matching invoices are still within the 5-day cooldown
+    if not eligible:
+        # Find the one that will exit cooldown soonest
+        soonest = min(
+            on_cooldown,
+            key=lambda r: r.get("last_reminded_at") or 0,
+            default=None,
+        )
+        days_left = 0
+        if soonest and soonest.get("last_reminded_at"):
+            days_left = max(
+                1,
+                math.ceil((soonest["last_reminded_at"] + cooldown_secs - now_ts) / 86400),
+            )
+        subject = f" for **{person_name}**" if person_name else ""
+        return ChatResponse(
+            reply=(
+                f"All matching overdue invoices{subject} were already reminded within "
+                f"the last 5 days. \u23f3 You can send the next reminder in "
+                f"**{days_left} day{'s' if days_left != 1 else ''}**."
+            ),
+            action="payment_status",
+            payment_invoices=_payment_invoices(on_cooldown),
+        )
+
+    # Step 3 — send reminders in chunks of 10 (Zoho bulk limit)
+    await _emit(f"📧 Sending reminders for {len(eligible)} invoice(s)…")
+    eligible_ids = [r["invoice_id"] for r in eligible]
+    all_succeeded: list[str] = []
+    all_failed: list[tuple[str, str]] = []
+
+    for chunk_start in range(0, len(eligible_ids), 10):
+        chunk = eligible_ids[chunk_start:chunk_start + 10]
+        result = await bulk_remind_invoices(chunk, db)
+        all_succeeded.extend(result["succeeded"])
+        all_failed.extend(result["failed"])
+
+    # Step 4 — update last_reminded_at ONLY for succeeded IDs
+    if all_succeeded:
+        await db.execute(
+            sa_update(InvoiceCache)
+            .where(InvoiceCache.invoice_id.in_(all_succeeded))
+            .values(last_reminded_at=int(now_ts))
+        )
+        await db.commit()
+
+    # Step 5 — build reply
+    succeeded_rows = [r for r in eligible if r["invoice_id"] in set(all_succeeded)]
+    failed_ids     = {fid for fid, _ in all_failed}
+    failed_rows    = [r for r in eligible if r["invoice_id"] in failed_ids]
+
+    parts: list[str] = []
+    if succeeded_rows:
+        lines = [f"✅ Reminder sent to **{r['customer_name']}** "
+                 f"({r.get('days_overdue', '?')} days overdue, "
+                 f"\u20b9{float(r['balance']):,.2f} outstanding)" for r in succeeded_rows]
+        parts.append(f"Reminded **{len(succeeded_rows)}** invoice(s):\n" + "\n".join(lines))
+
+    if failed_rows:
+        fail_lines = []
+        for r in failed_rows:
+            reason = next((msg for fid, msg in all_failed if fid == r["invoice_id"]), "unknown error")
+            fail_lines.append(f"\u26a0\ufe0f **{r['customer_name']}** — {reason[:120]}")
+        parts.append(f"\n{len(failed_rows)} reminder(s) failed:\n" + "\n".join(fail_lines))
+
+    reply = "\n".join(parts) if parts else "No reminders were sent."
+    return ChatResponse(
+        reply=reply,
+        action="invoice_sent" if all_succeeded else "error",
+        payment_invoices=_payment_invoices(succeeded_rows + failed_rows) or None,
+    )
+
+
+async def _handle_record_payment(
+    person_name: Optional[str],
+    amount: Optional[float],
+    payment_mode: str,
+    payment_date: str,
+    db: AsyncSession,
+    session_key: str | int = "web",
+    emit=None,
+) -> ChatResponse:
+    """
+    Look up client's outstanding invoices.
+    If multiple: return ambiguous_invoices.
+    If exactly one: build a PaymentRecordDraft, store in _pending_payment_drafts, and ask user to confirm.
+    """
+    import time
+    import httpx
+    _emit = emit or (lambda _: None)
+    if not person_name:
+        _pending_payment_customer_prompts[session_key] = {
+            "amount": amount,
+            "payment_mode": payment_mode,
+            "payment_date": payment_date,
+        }
+        return ChatResponse(
+            reply="Who is the payment from? Please specify a client name (e.g. *\"record payment from Vismay\"*).",
+            action="clarification_needed",
+        )
+
+    await _emit("🔄 Syncing payment data from Zoho...")
+    try:
+        await ensure_fresh_cache(db, force=True)
+    except Exception as e:
+        logger.error(f"Cache sync failed in record_payment: {e}")
+        return ChatResponse(reply=f"Failed to sync data from Zoho: {e}", action="error")
+
+    # Search for unpaid/partially-paid invoices for this client
+    pattern = f"%{person_name.lower().strip()}%"
+    result = await db.execute(
+        select(InvoiceCache)
+        .where(
+            func.lower(InvoiceCache.customer_name).like(pattern),
+            InvoiceCache.status.in_(("overdue", "sent", "partially_paid", "unpaid")),
+            InvoiceCache.balance > 0,
+        )
+        .order_by(InvoiceCache.due_date.asc().nulls_last())
+    )
+    unpaid_invoices = result.scalars().all()
+
+    if not unpaid_invoices:
+        # Check if client even exists or has paid invoices
+        contact_res = await db.execute(
+            select(InvoiceCache)
+            .where(func.lower(InvoiceCache.customer_name).like(pattern))
+        )
+        all_invoices = contact_res.scalars().all()
+        if not all_invoices:
+            return ChatResponse(
+                reply=f"I couldn't find any contact or invoices matching **{person_name}** in your records.",
+                action="clarification_needed",
+            )
+        else:
+            cust_name = all_invoices[0].customer_name
+            return ChatResponse(
+                reply=f"Good news — **{cust_name}** has no unpaid invoices right now. ✅",
+                action="payment_status",
+            )
+
+    customer_name = unpaid_invoices[0].customer_name
+
+    # If multiple unpaid invoices, disambiguate
+    if len(unpaid_invoices) > 1:
+        # Resolve customer ID beforehand so we have it for selection
+        contact_cache_res = await db.execute(
+            select(ContactCache.zoho_contact_id).where(ContactCache.name_lower == customer_name.lower().strip())
+        )
+        customer_id = contact_cache_res.scalar()
+
+        if not customer_id:
+            try:
+                contacts = await search_contact_by_name(customer_name, db)
+                if contacts:
+                    customer_id = contacts[0]["contact_id"]
+            except Exception as e:
+                logger.warning(f"Could not resolve customer_id for manual payment record: {e}")
+
+        # Save in disambiguation dictionary
+        _pending_payment_disambiguations[session_key] = {
+            "customer_name": customer_name,
+            "customer_id": customer_id or "",
+            "amount": amount,
+            "payment_mode": payment_mode,
+            "payment_date": payment_date,
+            "invoices": unpaid_invoices,
+        }
+
+        payment_invs = []
+        reply_lines = [f"I found {len(unpaid_invoices)} unpaid invoices for **{customer_name}** — which one should I apply the payment to?\n"]
+        for idx, inv in enumerate(unpaid_invoices, 1):
+            currency = inv.currency_code or "INR"
+            balance_fmt = f"₹{float(inv.balance):,.2f}" if currency == "INR" else f"{currency} {float(inv.balance):,.2f}"
+            due_fmt = inv.due_date.isoformat() if inv.due_date else "no due date"
+            reply_lines.append(f"{idx}. Invoice **#{inv.invoice_id}** — {balance_fmt} (due: {due_fmt})")
+            
+            days_overdue = None
+            if inv.status == "overdue" and inv.due_date:
+                from datetime import date as _date
+                days_overdue = max(0, (_date.today() - inv.due_date).days)
+                
+            payment_invs.append(
+                PaymentInvoice(
+                    invoice_id=inv.invoice_id,
+                    customer_name=inv.customer_name,
+                    status=inv.status,
+                    due_date=inv.due_date.isoformat() if inv.due_date else None,
+                    balance=float(inv.balance),
+                    total=float(inv.total),
+                    currency_code=inv.currency_code or "INR",
+                    zoho_view_url=inv.zoho_view_url,
+                    days_overdue=days_overdue,
+                    last_reminded_at=inv.last_reminded_at,
+                )
+            )
+        return ChatResponse(
+            reply="\n".join(reply_lines),
+            action="clarification_needed",
+            ambiguous_invoices=payment_invs,
+        )
+
+    # Exactly one matching unpaid invoice
+    inv = unpaid_invoices[0]
+    
+    # Resolve customer ID
+    contact_cache_res = await db.execute(
+        select(ContactCache.zoho_contact_id).where(ContactCache.name_lower == customer_name.lower().strip())
+    )
+    customer_id = contact_cache_res.scalar()
+
+    if not customer_id:
+        try:
+            contacts = await search_contact_by_name(customer_name, db)
+            if contacts:
+                customer_id = contacts[0]["contact_id"]
+        except Exception as e:
+            logger.warning(f"Could not resolve customer_id for manual payment record: {e}")
+
+    if not customer_id:
+        try:
+            from backend.services.zoho_service import _headers as _z_headers, get_org_id as _z_get_org_id
+            headers = await _z_headers(db)
+            org_id = await _z_get_org_id(db)
+            resp = await client.get(
+                f"{settings.zoho_api_base}/invoices/{inv.invoice_id}",
+                headers=headers,
+                params={"organization_id": org_id},
+            )
+            if resp.is_success:
+                invoice_detail = resp.json().get("invoice", {})
+                customer_id = invoice_detail.get("customer_id")
+        except Exception as e:
+            logger.error(f"Failed to fetch customer_id from Zoho for invoice {inv.invoice_id}: {e}")
+
+    if not customer_id:
+        return ChatResponse(
+            reply=f"Could not resolve the Zoho customer ID for **{customer_name}**. Please ensure Zoho is connected.",
+            action="error",
+        )
+
+    # Determine amount
+    actual_amount = float(inv.balance) if amount is None else amount
+    
+    # Overpayment check
+    is_overpayment = actual_amount > float(inv.balance)
+    overpayment_warn = ""
+    if is_overpayment:
+        overpayment_warn = f"\n\n⚠️ **Warning**: The payment amount (₹{actual_amount:,.2f}) exceeds the outstanding balance (₹{float(inv.balance):,.2f}) of this invoice. Approving this will create an overpayment credit in Zoho."
+
+    draft_id = str(uuid.uuid4())[:8]
+    
+    draft = PaymentRecordDraft(
+        draft_id=draft_id,
+        invoice_id=inv.invoice_id,
+        customer_id=customer_id,
+        customer_name=customer_name,
+        invoice_number=inv.invoice_id,
+        amount=actual_amount,
+        payment_mode=payment_mode,
+        payment_date=payment_date,
+        currency=inv.currency_code or "INR",
+    )
+    
+    _pending_payment_drafts[draft_id] = draft
+
+    currency_sym = "₹" if draft.currency == "INR" else f"{draft.currency} "
+    reply = (
+        f"I've prepared a draft to record a manual payment for **{customer_name}**:\n\n"
+        f"• Invoice ID: **{draft.invoice_id}**\n"
+        f"• Amount: **{currency_sym}{draft.amount:,.2f}**\n"
+        f"• Method: **{draft.payment_mode.upper()}**\n"
+        f"• Date: **{draft.payment_date}**"
+        f"{overpayment_warn}\n\n"
+        "Confirm below if this looks correct. ✓"
+    )
+    
+    return ChatResponse(
+        reply=reply,
+        action="payment_record_pending",
+        payment_record_draft=draft,
+    )
 
 
 def _should_auto_create(data: InvoiceData, contact_id: Optional[str]) -> bool:
@@ -664,6 +1030,95 @@ def _recurring_confirm_text(conv: RecurringConversation) -> str:
     return "\n".join(lines)
 
 
+async def _advance_recurring_conversation(
+    conv: RecurringConversation,
+    db: AsyncSession,
+    session_key: str | int,
+) -> ChatResponse:
+    # 1. Check if client name is missing
+    if not conv.client_name:
+        conv = conv.model_copy(update={"step": "client"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply="Sure! Let's set up a recurring invoice.\n\n👤 Who is the client? (name or email)",
+            action="clarification_needed",
+        )
+
+    # 2. Resolve client details if not already done
+    if not conv.zoho_contact_id and not conv.client_email:
+        name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
+            conv.client_name, conv.client_email, db
+        )
+        conv = conv.model_copy(update={
+            "client_name": name or conv.client_name,
+            "client_email": email or conv.client_email,
+            "zoho_contact_id": contact_id,
+            "is_new_contact": is_new,
+        })
+        if clarification:
+            if is_new and not conv.client_email:
+                conv = conv.model_copy(update={"step": "awaiting_customer_email"})
+                _pending_recurring_conv[session_key] = conv
+                return ChatResponse(reply=clarification, action="clarification_needed")
+            conv = conv.model_copy(update={"step": "client"})
+            _pending_recurring_conv[session_key] = conv
+            return ChatResponse(reply=clarification, action="clarification_needed")
+
+    # 3. Check if new customer requires an email address
+    if conv.is_new_contact and not conv.client_email:
+        conv = conv.model_copy(update={"step": "awaiting_customer_email"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply=f"📧 **{conv.client_name}** isn't in your Zoho contacts yet. What's their email address so I can create them?\n\n_(Reply **skip** to proceed without an email)_",
+            action="clarification_needed",
+        )
+
+    # 4. Check if item/service name is missing
+    if not conv.item_name:
+        conv = conv.model_copy(update={"step": "item_name"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)",
+            action="clarification_needed",
+        )
+
+    # 5. Check if amount is missing
+    if conv.amount is None:
+        conv = conv.model_copy(update={"step": "amount"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply=f"Got it — for **{conv.item_name}**. 💰 What's the amount and currency? (e.g. ₹15,000)",
+            action="clarification_needed",
+        )
+
+    # 6. Check if frequency is missing
+    if not conv.frequency:
+        conv = conv.model_copy(update={"step": "frequency"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply="🔁 How often should the invoice repeat?\n**monthly / weekly / yearly / daily**",
+            action="clarification_needed",
+        )
+
+    # 7. Check if start_date is missing
+    if not conv.start_date:
+        conv = conv.model_copy(update={"step": "start_date"})
+        _pending_recurring_conv[session_key] = conv
+        return ChatResponse(
+            reply="📆 When should it start? (e.g. **today**, **2025-07-01**)",
+            action="clarification_needed",
+        )
+
+    # Complete! Show confirmation prompt
+    conv = conv.model_copy(update={"step": "confirm"})
+    _pending_recurring_conv[session_key] = conv
+    return ChatResponse(
+        reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
+        action="recurring_pending",
+        recurring_draft=conv,
+    )
+
+
 async def _handle_recurring_create(
     message: str,
     db: AsyncSession,
@@ -681,8 +1136,9 @@ async def _handle_recurring_create(
         step = conv.step
         msg = message.strip()
 
-        # Check if the user wants to cancel mid-conversation
-        if msg.lower() in ("cancel", "discard", "stop", "abort"):
+        # Check if the user wants to cancel mid-conversation (with typo support!)
+        clean_msg = msg.lower().strip(" .!?")
+        if any(c in clean_msg for c in ("cancel", "stop", "discard", "abort", "nevermind", "never mind", "cacell")):
             _pending_recurring_conv.pop(session_key, None)
             return ChatResponse(
                 reply="Recurring invoice draft cancelled. ✗",
@@ -698,34 +1154,13 @@ async def _handle_recurring_create(
                 proposed_email = email_match.group(0)
                 proposed_name = raw_client.replace(proposed_email, "").strip() or proposed_email.split("@")[0]
 
-            name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
-                proposed_name,
-                proposed_email,
-                db,
-            )
-
             conv = conv.model_copy(update={
-                "client_name": name or proposed_name,
-                "client_email": email,
-                "zoho_contact_id": contact_id,
-                "is_new_contact": is_new,
+                "client_name": proposed_name,
+                "client_email": proposed_email,
             })
+            return await _advance_recurring_conversation(conv, db, session_key)
 
-            if clarification:
-                if is_new and not email:
-                    conv = conv.model_copy(update={"step": "awaiting_customer_email"})
-                _pending_recurring_conv[session_key] = conv
-                return ChatResponse(reply=clarification, action="clarification_needed")
-
-            # Contact resolved/confirmed -> move to item_name
-            conv = conv.model_copy(update={"step": "item_name"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)",
-                action="clarification_needed",
-            )
-
-        if step == "awaiting_customer_email":
+        if step == "awaiting_customer_email" or step == "confirm_email":
             email_match = _EMAIL_RE.search(msg)
             if not email_match and msg.lower().strip() != "skip":
                 return ChatResponse(
@@ -735,36 +1170,23 @@ async def _handle_recurring_create(
             email = email_match.group(0) if email_match else None
             conv = conv.model_copy(update={
                 "client_email": email,
-                "step": "item_name",
+                "zoho_contact_id": None,  # force re-resolve
             })
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)",
-                action="clarification_needed",
-            )
+            return await _advance_recurring_conversation(conv, db, session_key)
 
         if step == "item_name":
-            conv = conv.model_copy(update={"item_name": msg, "step": "amount"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply=f"Got it — for **{conv.item_name}**. 💰 What's the amount and currency? (e.g. ₹15,000 or $500)",
-                action="clarification_needed",
-            )
+            conv = conv.model_copy(update={"item_name": msg})
+            return await _advance_recurring_conversation(conv, db, session_key)
 
         if step == "amount":
-            # Parse amount + currency from raw text
             nums = re.findall(r"[\d,]+(?:\.\d+)?", msg.replace(",", ""))
             currency = "INR" if any(c in msg for c in ("₹", "rs", "inr")) else (
                 "USD" if "$" in msg else conv.currency
             )
             if nums:
                 amount = float(nums[0].replace(",", ""))
-                conv = conv.model_copy(update={"amount": amount, "currency": currency, "step": "frequency"})
-                _pending_recurring_conv[session_key] = conv
-                return ChatResponse(
-                    reply="🔁 How often should the invoice repeat?\n**monthly / weekly / yearly / daily**",
-                    action="clarification_needed",
-                )
+                conv = conv.model_copy(update={"amount": amount, "currency": currency})
+                return await _advance_recurring_conversation(conv, db, session_key)
             return ChatResponse(reply="I didn't catch the amount. Please enter a number (e.g. ₹15000 or 500).", action="clarification_needed")
 
         if step == "frequency":
@@ -773,12 +1195,8 @@ async def _handle_recurring_create(
             freq = freq_map.get(msg.lower().strip())
             if not freq:
                 return ChatResponse(reply="Please choose: **monthly**, **weekly**, **yearly**, or **daily**.", action="clarification_needed")
-            conv = conv.model_copy(update={"frequency": freq, "step": "start_date"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply="📆 When should it start? (e.g. **today**, **2025-07-01**)",
-                action="clarification_needed",
-            )
+            conv = conv.model_copy(update={"frequency": freq})
+            return await _advance_recurring_conversation(conv, db, session_key)
 
         if step == "start_date":
             start = parse_relative_date(msg)
@@ -788,59 +1206,13 @@ async def _handle_recurring_create(
                     action="clarification_needed"
                 )
             conv = conv.model_copy(update={"start_date": start})
-
-            # ── Contact check before showing confirm card ──
-            if not conv.zoho_contact_id and not conv.client_email:
-                # Quick lookup — if not found, ask for email
-                name, email, contact_id, is_new, _clarification = await _resolve_manual_customer(
-                    conv.client_name,
-                    conv.client_email,
-                    db,
-                )
-                conv = conv.model_copy(update={
-                    "client_name": name or conv.client_name,
-                    "client_email": email,
-                    "zoho_contact_id": contact_id,
-                    "is_new_contact": is_new,
-                })
-                if is_new and not email:
-                    conv = conv.model_copy(update={"step": "confirm_email"})
-                    _pending_recurring_conv[session_key] = conv
-                    return ChatResponse(
-                        reply=f"📧 **{conv.client_name}** isn't in your Zoho contacts yet. What's their email address so I can create them?\n\n_(Reply **skip** to proceed without an email)_",
-                        action="clarification_needed",
-                    )
-
-            conv = conv.model_copy(update={"step": "confirm"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
-                action="recurring_pending",
-                recurring_draft=conv,
-            )
-
-        if step == "confirm_email":
-            email_match = _EMAIL_RE.search(msg)
-            if not email_match and msg.lower().strip() != "skip":
-                return ChatResponse(
-                    reply="Please enter a valid email address, or say **skip** to proceed without an email.",
-                    action="clarification_needed",
-                )
-            email = email_match.group(0) if email_match else None
-            conv = conv.model_copy(update={"client_email": email, "step": "confirm"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(
-                reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
-                action="recurring_pending",
-                recurring_draft=conv,
-            )
+            return await _advance_recurring_conversation(conv, db, session_key)
 
         if step == "confirm":
             if any(w in msg.lower() for w in ("confirm", "yes", "create", "go", "ok", "do it", "proceed")):
                 return await _execute_recurring_create(conv, db, emit, session_key)
             _pending_recurring_conv.pop(session_key, None)
             return ChatResponse(reply="Recurring invoice cancelled. ✗", action="clarification_needed")
-
 
     # ── No active conversation — try to extract from message ──────────────────
     await emit("🧠 Extracting recurring invoice details…")
@@ -854,15 +1226,7 @@ async def _handle_recurring_create(
         else:
             start_raw = None
 
-
     conv = RecurringConversation(
-        step="confirm" if all([
-            extracted.get("client_name"),
-            extracted.get("item_name"),
-            extracted.get("amount"),
-            extracted.get("frequency"),
-            start_raw,
-        ]) else "client",
         client_name=extracted.get("client_name"),
         client_email=extracted.get("client_email"),
         item_name=extracted.get("item_name"),
@@ -873,68 +1237,7 @@ async def _handle_recurring_create(
         start_date=start_raw,
         end_date=extracted.get("end_date"),
     )
-    _pending_recurring_conv[session_key] = conv
-
-    # All fields present → check if contact resolves
-    if conv.step == "confirm":
-        name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
-            conv.client_name,
-            conv.client_email,
-            db,
-        )
-        conv = conv.model_copy(update={
-            "client_name": name or conv.client_name,
-            "client_email": email or conv.client_email,
-            "zoho_contact_id": contact_id,
-            "is_new_contact": is_new,
-        })
-        if clarification:
-            if is_new and not email:
-                conv = conv.model_copy(update={"step": "awaiting_customer_email"})
-            _pending_recurring_conv[session_key] = conv
-            return ChatResponse(reply=clarification, action="clarification_needed")
-
-        # Contact is good -> go straight to confirm card
-        return ChatResponse(
-            reply=_recurring_confirm_text(conv) + "\n\nReply **confirm** to create or **cancel** to discard.",
-            action="recurring_pending",
-            recurring_draft=conv,
-        )
-
-    # Missing fields → do contact lookup first, then start conversation
-    if conv.client_name and not conv.zoho_contact_id:
-        name, email, contact_id, is_new, _cl = await _resolve_manual_customer(
-            conv.client_name,
-            conv.client_email,
-            db,
-        )
-        conv = conv.model_copy(update={
-            "client_name": name or conv.client_name,
-            "client_email": email or conv.client_email,
-            "zoho_contact_id": contact_id,
-            "is_new_contact": is_new,
-        })
-        _pending_recurring_conv[session_key] = conv
-
-    if not conv.client_name:
-        conv = conv.model_copy(update={"step": "client"})
-        _pending_recurring_conv[session_key] = conv
-        return ChatResponse(reply="Sure! Let's set up a recurring invoice.\n\n👤 Who is the client? (name or email)", action="clarification_needed")
-    if not conv.item_name:
-        conv = conv.model_copy(update={"step": "item_name"})
-        _pending_recurring_conv[session_key] = conv
-        return ChatResponse(reply="📦 What is the service or item name? (e.g. **Monthly Website Maintenance**)", action="clarification_needed")
-    if conv.amount is None:
-        conv = conv.model_copy(update={"step": "amount"})
-        _pending_recurring_conv[session_key] = conv
-        return ChatResponse(reply=f"Got it — for **{conv.item_name or conv.client_name}**. 💰 What's the amount and currency?", action="clarification_needed")
-    if not conv.frequency:
-        conv = conv.model_copy(update={"step": "frequency"})
-        _pending_recurring_conv[session_key] = conv
-        return ChatResponse(reply="🔁 How often? (**monthly / weekly / yearly / daily**)", action="clarification_needed")
-    conv = conv.model_copy(update={"step": "start_date"})
-    _pending_recurring_conv[session_key] = conv
-    return ChatResponse(reply="📆 When should it start? (e.g. **today**, **2025-07-01**)", action="clarification_needed")
+    return await _advance_recurring_conversation(conv, db, session_key)
 
 
 
@@ -1077,6 +1380,572 @@ async def _handle_recurring_stop(
 
 
 
+def _estimate_url(estimate_id: str) -> str:
+    base = _ZOHO_APP_BASE.get(settings.ZOHO_REGION, "https://invoice.zoho.com")
+    return f"{base}/app#/estimates/{estimate_id}"
+
+
+def _format_estimate_amount(est: dict) -> str:
+    currency = est.get("currency_code") or "INR"
+    total = float(est.get("total") or 0.0)
+    if currency == "INR":
+        return f"₹{total:,.2f}"
+    return f"{currency} {total:,.2f}"
+
+
+def _estimate_matches_ref(est: dict, estimate_ref: str) -> bool:
+    ref = estimate_ref.lower().replace(" ", "")
+    number = (est.get("estimate_number") or "").lower().replace(" ", "")
+    est_id = (est.get("estimate_id") or "").lower()
+    return ref in number or ref in est_id or number.endswith(ref.lstrip("#"))
+
+
+def _estimate_matches_person(est: dict, person_name: str) -> bool:
+    return person_name.lower().strip() in (est.get("customer_name") or "").lower()
+
+
+def _mark_estimate_status(estimate_id: str, status: str) -> None:
+    for i, est in enumerate(_recent_estimates):
+        if est.zoho_estimate_id == estimate_id:
+            _recent_estimates[i] = est.model_copy(update={"status": status})
+            break
+
+
+async def _fetch_estimates_by_statuses(
+    db: AsyncSession,
+    statuses: set[str],
+) -> list[dict]:
+    """Fetch estimates from Zoho for one or more statuses, deduplicated by ID."""
+    filter_map = {
+        "sent": "Status.Sent",
+        "accepted": "Status.Accepted",
+        "declined": "Status.Declined",
+        "draft": "Status.Draft",
+    }
+    seen: dict[str, dict] = {}
+    for status in statuses:
+        filter_by = filter_map.get(status)
+        if not filter_by:
+            continue
+        try:
+            rows = await list_estimates(db, filter_by=filter_by)
+        except Exception as e:
+            logger.warning(f"Could not list estimates with {filter_by}: {e}")
+            continue
+        for row in rows:
+            est_id = row.get("estimate_id")
+            if est_id and est_id not in seen:
+                seen[est_id] = row
+    return list(seen.values())
+
+
+async def _resolve_estimate_candidates(
+    db: AsyncSession,
+    purpose: str,
+    person_name: Optional[str] = None,
+    estimate_ref: Optional[str] = None,
+) -> list[dict]:
+    """
+    Find estimates relevant to accept/reject/convert/send actions.
+    Checks session history first, then queries Zoho across relevant statuses.
+    """
+    allowed_by_purpose = {
+        "accept": {"sent", "draft", "declined"},
+        "reject": {"sent", "draft", "accepted"},
+        "convert": {"accepted"},
+        "send": {"accepted"},
+    }
+    allowed_statuses = allowed_by_purpose.get(purpose, {"accepted"})
+
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Session estimates — re-fetch current status from Zoho when possible
+    for recent in reversed(_recent_estimates):
+        if recent.zoho_estimate_id in seen_ids:
+            continue
+        try:
+            details = await get_estimate(recent.zoho_estimate_id, db)
+            if not details:
+                continue
+            status = (details.get("status") or "").lower()
+            if status in ("invoiced", "partially_invoiced", "expired"):
+                continue
+            if status not in allowed_statuses:
+                continue
+            if person_name and not _estimate_matches_person(details, person_name):
+                continue
+            if estimate_ref and not _estimate_matches_ref(details, estimate_ref):
+                continue
+            candidates.append(details)
+            seen_ids.add(recent.zoho_estimate_id)
+        except Exception as e:
+            logger.warning(f"Could not refresh session estimate {recent.zoho_estimate_id}: {e}")
+
+    zoho_rows = await _fetch_estimates_by_statuses(db, allowed_statuses)
+    for row in zoho_rows:
+        est_id = row.get("estimate_id")
+        if not est_id or est_id in seen_ids:
+            continue
+        status = (row.get("status") or "").lower()
+        if status in ("invoiced", "partially_invoiced", "expired"):
+            continue
+        if person_name and not _estimate_matches_person(row, person_name):
+            continue
+        if estimate_ref and not _estimate_matches_ref(row, estimate_ref):
+            continue
+        candidates.append(row)
+        seen_ids.add(est_id)
+
+    # Most recent first — Zoho list is usually newest-first; session hits are already ordered
+    candidates.sort(
+        key=lambda e: e.get("date") or e.get("created_time") or "",
+        reverse=True,
+    )
+    return candidates
+
+
+def _ambiguous_estimate_cards(estimates: list[dict]) -> list[AmbiguousEstimate]:
+    cards = []
+    for e in estimates:
+        cards.append(AmbiguousEstimate(
+            estimate_id=e["estimate_id"],
+            estimate_number=e.get("estimate_number") or "",
+            customer_name=e.get("customer_name") or "",
+            status=e.get("status") or "",
+            amount=float(e.get("total") or 0.0),
+            currency=e.get("currency_code") or "INR",
+            date=e.get("date"),
+            estimate_url=_estimate_url(e.get("estimate_id", "")),
+        ))
+    return cards
+
+
+def _estimate_disambiguation_reply(
+    estimates: list[dict],
+    purpose: str,
+) -> str:
+    verb = {
+        "accept": "accept",
+        "reject": "reject/decline",
+        "convert": "convert to an invoice",
+        "send": "convert and send an invoice for",
+    }.get(purpose, "select")
+    lines = [f"I found multiple estimates. Which one would you like to {verb}? Reply with the number:"]
+    for idx, e in enumerate(estimates, 1):
+        status = (e.get("status") or "unknown").capitalize()
+        lines.append(
+            f"{idx}. Estimate **#{e.get('estimate_number')}** for **{e.get('customer_name')}** "
+            f"— {_format_estimate_amount(e)} ({status})"
+        )
+    return "\n".join(lines)
+
+
+async def _build_invoice_draft_from_estimate(details: dict) -> ManualInvoiceDraft:
+    raw_items = details.get("line_items") or []
+    line_items = [
+        ManualInvoiceLineItem(
+            item_name=item.get("name") or "Service",
+            task_description=item.get("description") or "",
+            amount=float(item.get("rate") or 0.0),
+        )
+        for item in raw_items
+    ]
+    draft_id = str(uuid.uuid4())
+    draft = ManualInvoiceDraft(
+        draft_id=draft_id,
+        client_name=details.get("customer_name") or "Unknown",
+        client_email=details.get("email"),
+        currency=details.get("currency_code") or "INR",
+        zoho_contact_id=details.get("customer_id"),
+        is_new_contact=False,
+        line_items=line_items,
+        estimate_id=details.get("estimate_id"),
+    )
+    _pending_manual_invoice_drafts[draft_id] = draft
+    return draft
+
+
+async def _convert_accepted_estimate_to_invoice(
+    estimate_id: str,
+    db: AsyncSession,
+    send_email: bool = False,
+) -> tuple[Optional[CreatedInvoice], str]:
+    """Convert an accepted estimate to an invoice; optionally email it."""
+    details = await get_estimate(estimate_id, db)
+    status = (details.get("status") or "").lower()
+    if status in ("invoiced", "partially_invoiced"):
+        return None, f"Estimate **#{details.get('estimate_number')}** has already been converted to an invoice."
+    if status != "accepted":
+        return None, (
+            f"Estimate **#{details.get('estimate_number')}** is **{status}** — "
+            "accept it first, then ask me to send the invoice."
+        )
+
+    invoice = await convert_estimate_to_invoice(estimate_id=estimate_id, db=db)
+    client_email = details.get("email")
+    total_amount = float(details.get("total") or 0.0)
+    email_sent = False
+    if send_email:
+        email_sent, _ = await send_invoice_email(
+            invoice.get("invoice_id", ""),
+            db,
+            to_email=client_email,
+        )
+
+    created = CreatedInvoice(
+        zoho_invoice_id=invoice.get("invoice_id", ""),
+        invoice_number=invoice.get("invoice_number", ""),
+        client_name=details.get("customer_name") or "Unknown",
+        client_email=client_email,
+        amount=total_amount,
+        currency=details.get("currency_code") or "INR",
+        invoice_url=invoice.get("invoice_url"),
+        email_sent=email_sent,
+    )
+    _recent_invoices.append(created)
+    return created, ""
+
+
+async def _handle_estimate_disambiguation_pick(
+    disambig: dict,
+    selected_idx: int,
+    db: AsyncSession,
+) -> ChatResponse:
+    est = disambig["estimates"][selected_idx]
+    mode = disambig.get("mode", "convert")
+    estimate_id = est["estimate_id"]
+
+    if mode == "accept":
+        try:
+            updated = await update_estimate_status(estimate_id, "accepted", db)
+            _mark_estimate_status(estimate_id, "accepted")
+            number = updated.get("estimate_number") or est.get("estimate_number")
+            customer = updated.get("customer_name") or est.get("customer_name")
+            return ChatResponse(
+                reply=(
+                    f"Estimate **#{number}** for **{customer}** is now **accepted** ✅\n\n"
+                    "Say **\"send the invoice\"** or **\"convert to invoice\"** when you're ready to bill."
+                ),
+                action="estimate_accepted",
+            )
+        except Exception as e:
+            logger.error(f"Failed to accept estimate {estimate_id}: {e}")
+            return ChatResponse(reply=f"Could not accept estimate: {e}", action="error")
+
+    if mode == "reject":
+        try:
+            updated = await update_estimate_status(estimate_id, "declined", db)
+            _mark_estimate_status(estimate_id, "declined")
+            number = updated.get("estimate_number") or est.get("estimate_number")
+            customer = updated.get("customer_name") or est.get("customer_name")
+            return ChatResponse(
+                reply=f"Estimate **#{number}** for **{customer}** has been **declined**. ✗",
+                action="estimate_declined",
+            )
+        except Exception as e:
+            logger.error(f"Failed to decline estimate {estimate_id}: {e}")
+            return ChatResponse(reply=f"Could not decline estimate: {e}", action="error")
+
+    if mode == "send":
+        created, err = await _convert_accepted_estimate_to_invoice(estimate_id, db, send_email=True)
+        if err:
+            return ChatResponse(reply=err, action="clarification_needed")
+        return ChatResponse(
+            reply=f"Invoice **#{created.invoice_number}** created and sent to **{created.client_name}**. 📧",
+            action="invoice_created",
+            invoices_created=[created],
+        )
+
+    # convert (default)
+    try:
+        details = await get_estimate(estimate_id, db)
+    except Exception as e:
+        logger.error(f"Failed to fetch estimate details for {estimate_id}: {e}")
+        return ChatResponse(reply=f"Could not fetch estimate details: {e}", action="error")
+
+    status = (details.get("status") or "").lower()
+    if status in ("invoiced", "partially_invoiced"):
+        return ChatResponse(
+            reply=f"Estimate **#{details.get('estimate_number')}** has already been converted to an invoice.",
+            action="clarification_needed",
+        )
+
+    draft = await _build_invoice_draft_from_estimate(details)
+    return ChatResponse(
+        reply=(
+            f"Found accepted estimate **#{details.get('estimate_number')}** for **{draft.client_name}**. "
+            "Here is the draft invoice for your final approval:"
+        ),
+        action="manual_invoice_pending",
+        manual_invoice_draft=draft,
+    )
+
+
+async def _handle_accept_estimate(
+    person_name: Optional[str],
+    estimate_ref: Optional[str],
+    db: AsyncSession,
+    session_key: str | int,
+) -> ChatResponse:
+    candidates = await _resolve_estimate_candidates(
+        db, purpose="accept", person_name=person_name, estimate_ref=estimate_ref,
+    )
+
+    if not candidates:
+        # Helpful hint if sent estimates exist but none matched filters
+        sent = await _fetch_estimates_by_statuses(db, {"sent"})
+        if person_name:
+            sent = [e for e in sent if _estimate_matches_person(e, person_name)]
+        if sent:
+            hint = (
+                f"I couldn't find a sent estimate to accept for **{person_name}**."
+                if person_name
+                else "I couldn't find a sent estimate to accept."
+            )
+            return ChatResponse(
+                reply=f"{hint} There are **{len(sent)}** sent estimate(s) in Zoho — try specifying the estimate number (e.g. **QT-000004**).",
+                action="clarification_needed",
+            )
+        if person_name:
+            return ChatResponse(
+                reply=f"I couldn't find any sent estimates for **{person_name}** to accept.",
+                action="clarification_needed",
+            )
+        return ChatResponse(
+            reply="There are no sent estimates waiting to be accepted in your Zoho account right now.",
+            action="clarification_needed",
+        )
+
+    if len(candidates) > 1:
+        _pending_estimate_disambiguations[session_key] = {
+            "estimates": candidates,
+            "mode": "accept",
+        }
+        return ChatResponse(
+            reply=_estimate_disambiguation_reply(candidates, "accept"),
+            action="clarification_needed",
+            ambiguous_estimates=_ambiguous_estimate_cards(candidates),
+            disambiguation_mode="accept",
+        )
+
+    est = candidates[0]
+    status = (est.get("status") or "").lower()
+    if status == "accepted":
+        return ChatResponse(
+            reply=(
+                f"Estimate **#{est.get('estimate_number')}** for **{est.get('customer_name')}** "
+                "is already **accepted** ✅\n\n"
+                "Say **\"send the invoice\"** or **\"convert to invoice\"** to proceed."
+            ),
+            action="clarification_needed",
+        )
+
+    try:
+        updated = await update_estimate_status(est["estimate_id"], "accepted", db)
+        _mark_estimate_status(est["estimate_id"], "accepted")
+        number = updated.get("estimate_number") or est.get("estimate_number")
+        customer = updated.get("customer_name") or est.get("customer_name")
+        return ChatResponse(
+            reply=(
+                f"Estimate **#{number}** for **{customer}** is now **accepted** ✅\n\n"
+                "Say **\"send the invoice\"** or **\"convert to invoice\"** when you're ready to bill."
+            ),
+            action="estimate_accepted",
+        )
+    except Exception as e:
+        logger.error(f"Failed to accept estimate {est.get('estimate_id')}: {e}")
+        return ChatResponse(reply=f"Could not accept estimate: {e}", action="error")
+
+
+async def _handle_reject_estimate(
+    person_name: Optional[str],
+    estimate_ref: Optional[str],
+    db: AsyncSession,
+    session_key: str | int,
+) -> ChatResponse:
+    candidates = await _resolve_estimate_candidates(
+        db, purpose="reject", person_name=person_name, estimate_ref=estimate_ref,
+    )
+
+    if not candidates:
+        if person_name:
+            return ChatResponse(
+                reply=f"I couldn't find any estimates for **{person_name}** that can be declined.",
+                action="clarification_needed",
+            )
+        return ChatResponse(
+            reply="There are no estimates in your Zoho account that can be declined right now.",
+            action="clarification_needed",
+        )
+
+    if len(candidates) > 1:
+        _pending_estimate_disambiguations[session_key] = {
+            "estimates": candidates,
+            "mode": "reject",
+        }
+        return ChatResponse(
+            reply=_estimate_disambiguation_reply(candidates, "reject"),
+            action="clarification_needed",
+            ambiguous_estimates=_ambiguous_estimate_cards(candidates),
+            disambiguation_mode="reject",
+        )
+
+    est = candidates[0]
+    status = (est.get("status") or "").lower()
+    if status == "declined":
+        return ChatResponse(
+            reply=f"Estimate **#{est.get('estimate_number')}** is already **declined**.",
+            action="clarification_needed",
+        )
+    if status in ("invoiced", "partially_invoiced"):
+        return ChatResponse(
+            reply=f"Estimate **#{est.get('estimate_number')}** has already been converted to an invoice and can't be declined.",
+            action="clarification_needed",
+        )
+
+    try:
+        updated = await update_estimate_status(est["estimate_id"], "declined", db)
+        _mark_estimate_status(est["estimate_id"], "declined")
+        number = updated.get("estimate_number") or est.get("estimate_number")
+        customer = updated.get("customer_name") or est.get("customer_name")
+        return ChatResponse(
+            reply=f"Estimate **#{number}** for **{customer}** has been **declined**. ✗",
+            action="estimate_declined",
+        )
+    except Exception as e:
+        logger.error(f"Failed to decline estimate {est.get('estimate_id')}: {e}")
+        return ChatResponse(reply=f"Could not decline estimate: {e}", action="error")
+
+
+async def _handle_convert_estimate(
+    person_name: Optional[str],
+    db: AsyncSession,
+    session_key: str | int,
+) -> ChatResponse:
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{settings.zoho_api_base}/estimates",
+                headers=await _headers(db),
+                params={
+                    "organization_id": await get_org_id(db),
+                    "filter_by": "Status.Accepted",
+                }
+            )
+            resp.raise_for_status()
+            estimates = resp.json().get("estimates", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch estimates from Zoho: {e}")
+        return ChatResponse(
+            reply=f"Could not fetch estimates: {e}",
+            action="error",
+        )
+
+    if person_name:
+        person_name_clean = person_name.lower().strip()
+        estimates = [
+            e for e in estimates
+            if person_name_clean in (e.get("customer_name") or "").lower()
+        ]
+
+    if not estimates:
+        if person_name:
+            return ChatResponse(
+                reply=f"I couldn't find any accepted estimates for **{person_name}**.",
+                action="clarification_needed",
+            )
+        else:
+            return ChatResponse(
+                reply="There are no accepted estimates in your Zoho account right now.",
+                action="clarification_needed",
+            )
+
+    # If exactly one estimate matches
+    if len(estimates) == 1:
+        est = estimates[0]
+        estimate_id = est["estimate_id"]
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{settings.zoho_api_base}/estimates/{estimate_id}",
+                    headers=await _headers(db),
+                    params={"organization_id": await get_org_id(db)}
+                )
+                resp.raise_for_status()
+                details = resp.json().get("estimate", {})
+        except Exception as e:
+            logger.error(f"Failed to fetch estimate details for {estimate_id}: {e}")
+            return ChatResponse(
+                reply=f"Could not fetch estimate details: {e}",
+                action="error",
+            )
+
+        status = details.get("status", "").lower()
+        if status in ("invoiced", "partially_invoiced"):
+            return ChatResponse(
+                reply=f"Estimate **#{details.get('estimate_number')}** has already been converted to an invoice.",
+                action="clarification_needed"
+            )
+
+        # Build draft
+        raw_items = details.get("line_items") or []
+        line_items = []
+        for item in raw_items:
+            line_items.append(ManualInvoiceLineItem(
+                item_name=item.get("name") or "Service",
+                task_description=item.get("description") or "",
+                amount=float(item.get("rate") or 0.0),
+            ))
+
+        draft_id = str(uuid.uuid4())
+        draft = ManualInvoiceDraft(
+            draft_id=draft_id,
+            client_name=details.get("customer_name") or "Unknown",
+            client_email=details.get("email"),
+            currency=details.get("currency_code") or "INR",
+            zoho_contact_id=details.get("customer_id"),
+            is_new_contact=False,
+            line_items=line_items,
+            estimate_id=estimate_id,
+        )
+        _pending_manual_invoice_drafts[draft_id] = draft
+
+        return ChatResponse(
+            reply=f"Found accepted estimate **#{details.get('estimate_number')}** for **{draft.client_name}**. Here is the draft invoice for your final approval:",
+            action="manual_invoice_pending",
+            manual_invoice_draft=draft,
+        )
+
+    # If multiple estimates match
+    ambiguous = []
+    for e in estimates:
+        base = _ZOHO_APP_BASE.get(settings.ZOHO_REGION, "https://invoice.zoho.com")
+        est_url = f"{base}/app#/estimates/{e.get('estimate_id', '')}"
+        ambiguous.append(AmbiguousEstimate(
+            estimate_id=e["estimate_id"],
+            estimate_number=e.get("estimate_number") or "",
+            customer_name=e.get("customer_name") or "",
+            status=e.get("status") or "",
+            amount=float(e.get("total") or 0.0),
+            currency=e.get("currency_code") or "INR",
+            date=e.get("date"),
+            estimate_url=est_url,
+        ))
+
+    _pending_estimate_disambiguations[session_key] = {
+        "estimates": estimates,
+        "mode": "convert",
+    }
+
+    return ChatResponse(
+        reply=_estimate_disambiguation_reply(estimates, "convert"),
+        action="clarification_needed",
+        ambiguous_estimates=_ambiguous_estimate_cards(estimates),
+        disambiguation_mode="convert",
+    )
+
+
 async def process_chat(
     message: str,
     db: AsyncSession,
@@ -1104,6 +1973,228 @@ async def process_chat(
     if conversation_response:
         return conversation_response
 
+    # ── Check if user is replying to a payment customer prompt ────────────────
+    if session_key in _pending_payment_customer_prompts:
+        prompt_data = _pending_payment_customer_prompts.pop(session_key, None)
+        if normalized_message in ("cancel", "stop", "exit", "abort"):
+            return ChatResponse(reply="Payment recording cancelled. ✗", action="clarification_needed")
+        
+        person_name = message.strip()
+        return await _handle_record_payment(
+            person_name=person_name,
+            amount=prompt_data["amount"],
+            payment_mode=prompt_data["payment_mode"],
+            payment_date=prompt_data["payment_date"],
+            db=db,
+            session_key=session_key,
+            emit=emit
+        )
+
+    # ── Check if user is replying to an estimate ambiguity ───────────────────
+    if session_key in _pending_estimate_disambiguations and action not in (
+        "accept_estimate", "reject_estimate", "convert_estimate", "create_estimate"
+    ):
+        disambig = _pending_estimate_disambiguations[session_key]
+        if normalized_message in ("cancel", "stop", "exit", "abort"):
+            _pending_estimate_disambiguations.pop(session_key, None)
+            return ChatResponse(reply="Estimate action cancelled. ✗", action="clarification_needed")
+
+        selected_idx = None
+        m_idx = re.match(r"^(\d+)$", message.strip())
+        if m_idx:
+            idx = int(m_idx.group(1)) - 1
+            if 0 <= idx < len(disambig["estimates"]):
+                selected_idx = idx
+
+        if selected_idx is None:
+            clean_msg = message.strip().lower()
+            for idx, est in enumerate(disambig["estimates"]):
+                if clean_msg in (est.get("estimate_id") or "").lower() or clean_msg in (est.get("estimate_number") or "").lower():
+                    selected_idx = idx
+                    break
+
+        if selected_idx is not None:
+            est = disambig["estimates"][selected_idx]
+            mode = disambig.get("mode", "convert")  # accept | reject | convert
+            _pending_estimate_disambiguations.pop(session_key, None)
+
+            # ── Accept mode: just mark the estimate accepted ─────────────────
+            if mode == "accept":
+                try:
+                    updated = await update_estimate_status(est["estimate_id"], "accepted", db)
+                    _mark_estimate_status(est["estimate_id"], "accepted")
+                    number   = updated.get("estimate_number") or est.get("estimate_number")
+                    customer = updated.get("customer_name")   or est.get("customer_name")
+                    return ChatResponse(
+                        reply=(
+                            f"Estimate **#{number}** for **{customer}** is now **accepted** ✅\n\n"
+                            "Say **\"convert to invoice\"** when you're ready to bill."
+                        ),
+                        action="estimate_accepted",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to accept estimate {est.get('estimate_id')}: {e}")
+                    return ChatResponse(reply=f"Could not accept estimate: {e}", action="error")
+
+            # ── Reject mode: mark the estimate declined ──────────────────────
+            if mode == "reject":
+                status_now = (est.get("status") or "").lower()
+                if status_now in ("invoiced", "partially_invoiced"):
+                    return ChatResponse(
+                        reply=f"Estimate **#{est.get('estimate_number')}** has already been converted to an invoice and can't be declined.",
+                        action="clarification_needed",
+                    )
+                try:
+                    updated = await update_estimate_status(est["estimate_id"], "declined", db)
+                    _mark_estimate_status(est["estimate_id"], "declined")
+                    number   = updated.get("estimate_number") or est.get("estimate_number")
+                    customer = updated.get("customer_name")   or est.get("customer_name")
+                    return ChatResponse(
+                        reply=f"Estimate **#{number}** for **{customer}** has been **declined**. ✗",
+                        action="estimate_declined",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to decline estimate {est.get('estimate_id')}: {e}")
+                    return ChatResponse(reply=f"Could not decline estimate: {e}", action="error")
+
+            # ── Convert mode (default): build invoice draft ──────────────────
+            estimate_id = est["estimate_id"]
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{settings.zoho_api_base}/estimates/{estimate_id}",
+                        headers=await _headers(db),
+                        params={"organization_id": await get_org_id(db)}
+                    )
+                    resp.raise_for_status()
+                    details = resp.json().get("estimate", {})
+            except Exception as e:
+                logger.error(f"Failed to fetch estimate details for {estimate_id}: {e}")
+                return ChatResponse(
+                    reply=f"Could not fetch estimate details: {e}",
+                    action="error",
+                )
+
+            status = details.get("status", "").lower()
+            if status in ("invoiced", "partially_invoiced"):
+                return ChatResponse(
+                    reply=f"Estimate **#{details.get('estimate_number')}** has already been converted to an invoice.",
+                    action="clarification_needed"
+                )
+
+            raw_items = details.get("line_items") or []
+            line_items = []
+            for item in raw_items:
+                line_items.append(ManualInvoiceLineItem(
+                    item_name=item.get("name") or "Service",
+                    task_description=item.get("description") or "",
+                    amount=float(item.get("rate") or 0.0),
+                ))
+
+            draft_id = str(uuid.uuid4())
+            draft = ManualInvoiceDraft(
+                draft_id=draft_id,
+                client_name=details.get("customer_name") or "Unknown",
+                client_email=details.get("email"),
+                currency=details.get("currency_code") or "INR",
+                zoho_contact_id=details.get("customer_id"),
+                is_new_contact=False,
+                line_items=line_items,
+                estimate_id=estimate_id,
+            )
+            _pending_manual_invoice_drafts[draft_id] = draft
+
+            return ChatResponse(
+                reply=f"Here is the draft invoice from estimate **#{details.get('estimate_number')}** for **{draft.client_name}**. Approve below when you're ready:",
+                action="manual_invoice_pending",
+                manual_invoice_draft=draft,
+            )
+        else:
+            mode = disambig.get("mode", "convert")
+            verb = {"accept": "accept", "reject": "decline", "convert": "convert"}.get(mode, "convert")
+            reply_lines = [f"I didn't recognize that selection. Please choose a number from 1 to {len(disambig['estimates'])} or type the estimate number:"]
+            for idx, est in enumerate(disambig["estimates"], 1):
+                currency = est.get("currency_code") or "INR"
+                total_fmt = f"₹{float(est.get('total') or 0.0):,.2f}" if currency == "INR" else f"{currency} {float(est.get('total') or 0.0):,.2f}"
+                reply_lines.append(f"{idx}. Estimate **#{est.get('estimate_number')}** for **{est.get('customer_name')}** — {total_fmt}")
+            return ChatResponse(
+                reply="\n".join(reply_lines),
+                action="clarification_needed",
+            )
+
+    # ── Check if user is replying to a payment ambiguity ────────────────────
+    if session_key in _pending_payment_disambiguations:
+        disambig = _pending_payment_disambiguations[session_key]
+        if normalized_message in ("cancel", "stop", "exit", "abort"):
+            _pending_payment_disambiguations.pop(session_key, None)
+            return ChatResponse(reply="Payment recording cancelled. ✗", action="clarification_needed")
+
+        selected_idx = None
+        m_idx = re.match(r"^(\d+)$", message.strip())
+        if m_idx:
+            idx = int(m_idx.group(1)) - 1
+            if 0 <= idx < len(disambig["invoices"]):
+                selected_idx = idx
+
+        if selected_idx is None:
+            clean_msg = message.strip()
+            for idx, inv in enumerate(disambig["invoices"]):
+                if clean_msg == str(inv.invoice_id):
+                    selected_idx = idx
+                    break
+
+        if selected_idx is not None:
+            inv = disambig["invoices"][selected_idx]
+            _pending_payment_disambiguations.pop(session_key, None)
+
+            actual_amount = float(inv.balance) if disambig["amount"] is None else disambig["amount"]
+            is_overpayment = actual_amount > float(inv.balance)
+            overpayment_warn = ""
+            if is_overpayment:
+                overpayment_warn = f"\n\n⚠️ **Warning**: The payment amount (₹{actual_amount:,.2f}) exceeds the outstanding balance (₹{float(inv.balance):,.2f}) of this invoice. Approving this will create an overpayment credit in Zoho."
+
+            draft_id = str(uuid.uuid4())[:8]
+            draft = PaymentRecordDraft(
+                draft_id=draft_id,
+                invoice_id=inv.invoice_id,
+                customer_id=disambig["customer_id"],
+                customer_name=disambig["customer_name"],
+                invoice_number=inv.invoice_id,
+                amount=actual_amount,
+                payment_mode=disambig["payment_mode"],
+                payment_date=disambig["payment_date"],
+                currency=inv.currency_code or "INR",
+            )
+            _pending_payment_drafts[draft_id] = draft
+
+            currency_sym = "₹" if draft.currency == "INR" else f"{draft.currency} "
+            reply = (
+                f"Got it! Selected **Invoice #{inv.invoice_id}**.\n\n"
+                f"I've prepared a draft to record a manual payment for **{draft.customer_name}**:\n\n"
+                f"• Invoice ID: **{draft.invoice_id}**\n"
+                f"• Amount: **{currency_sym}{draft.amount:,.2f}**\n"
+                f"• Method: **{draft.payment_mode.upper()}**\n"
+                f"• Date: **{draft.payment_date}**"
+                f"{overpayment_warn}\n\n"
+                "Confirm below if this looks correct. ✓"
+            )
+            return ChatResponse(
+                reply=reply,
+                action="payment_record_pending",
+                payment_record_draft=draft,
+            )
+        else:
+            reply_lines = [f"I didn't recognize that selection. Please choose a number from 1 to {len(disambig['invoices'])} or type the invoice ID:"]
+            for idx, inv in enumerate(disambig["invoices"], 1):
+                currency = inv.currency_code or "INR"
+                balance_fmt = f"₹{float(inv.balance):,.2f}" if currency == "INR" else f"{currency} {float(inv.balance):,.2f}"
+                due_fmt = inv.due_date.isoformat() if inv.due_date else "no due date"
+                reply_lines.append(f"{idx}. Invoice **#{inv.invoice_id}** — {balance_fmt} (due: {due_fmt})")
+            return ChatResponse(
+                reply="\n".join(reply_lines),
+                action="clarification_needed",
+            )
+
     # ── Check if a recurring invoice conversation is in progress ────────────
     if session_key in _pending_recurring_conv:
         return await _handle_recurring_create(message, db, emit, session_key)
@@ -1119,9 +2210,12 @@ async def process_chat(
         return ChatResponse(
             reply=(
                 "Hey 👋 I am Invoice Agent! Happy to help. You can ask me things like:\n"
-                "• \"Jacks invoice from yesterday's design work\"\n"
-                "• \"Check emails from last Sunday\"\n"
-                "• \"Who hasn't paid me?\" or \"Payment summary\"\n"
+                "• Jacks invoice from yesterday's design work\n"
+                "• Check emails from last Sunday\n"
+                "• Who hasn't paid me? or Payment summary\n"
+                "• Add payment for a client\n"
+                "• Make a new invoice for clients\n"
+                "• Make a new recuring invoice for clients and also stop them\n"
                 "What would you like to do?"
             ),
             action="clarification_needed",
@@ -1130,9 +2224,9 @@ async def process_chat(
         return ChatResponse(
             reply=(
                 "Hmm, I'm not quite sure what you need. You could try something like:\n"
-                "• \"Invoice Jacks for the design work from yesterday\"\n"
-                "• \"Look at emails from last Sunday\"\n"
-                "• \"Make an invoice for Rahul for the website project\""
+                "• Invoice Jacks for the design work from yesterday\n"
+                "• Look at emails from last Sunday\n"
+                "• Make an invoice for Rahul for the website project for 9000"
             ),
             action="clarification_needed",
         )
@@ -1143,71 +2237,80 @@ async def process_chat(
     if action == "create_invoice":
         parsed = await extract_manual_invoice_request(message)
 
-        client_name  = person_name
-        client_email = None
-        currency     = parsed.get("currency") or "INR"
-        items = [
-            ManualInvoiceLineItem(**item)
-            for item in (parsed.get("items") or [])
-            if item.get("item_name") and item.get("task_description") and item.get("amount") is not None
-        ]
+        client_name = parsed.get("client_name") or person_name
+        client_email = parsed.get("client_email")
+        currency = parsed.get("currency") or "INR"
+        
+        # Pull first item details if present in parsed payload
+        item_name = None
+        item_desc = None
+        item_amount = None
+        
+        parsed_items = parsed.get("items") or []
+        if parsed_items:
+            first_item = parsed_items[0]
+            item_name = first_item.get("item_name")
+            item_desc = first_item.get("task_description") or item_name
+            item_amount = first_item.get("amount")
 
-        # If we have enough for a full draft (name + items), show confirm card
-        if client_name and items:
-            name, email, contact_id, is_new, clarification = await _resolve_manual_customer(
-                client_name, client_email, db
-            )
-            if clarification and not email:
-                _manual_invoice_conversation = ManualInvoiceConversation(
-                    step="awaiting_customer_email" if is_new and not email else "awaiting_customer",
-                    client_name=name or client_name,
-                    client_email=email,
-                    currency=currency,
-                    zoho_contact_id=contact_id,
-                    is_new_contact=is_new,
-                )
-                return ChatResponse(reply=clarification, action="clarification_needed")
-
-            draft = ManualInvoiceDraft(
-                draft_id=str(uuid.uuid4()),
-                client_name=name or client_name,
-                client_email=email,
-                currency=currency,
-                zoho_contact_id=contact_id,
-                is_new_contact=is_new,
-                line_items=items,
-            )
-            _pending_manual_invoice_drafts[draft.draft_id] = draft
-            return ChatResponse(
-                reply=_manual_invoice_summary(draft),
-                action="manual_invoice_pending",
-                manual_invoice_draft=draft,
-            )
-
-        # If we have a name but no items — resolve contact then ask for service
-        if client_name:
-            name, email, contact_id, is_new, _cl = await _resolve_manual_customer(
-                client_name, client_email, db
-            )
-            _manual_invoice_conversation = ManualInvoiceConversation(
-                step="awaiting_service_name",
-                client_name=name or client_name,
-                client_email=email,
-                currency=currency,
-                zoho_contact_id=contact_id,
-                is_new_contact=is_new,
-            )
-            return ChatResponse(
-                reply=f"📦 What service or work should I invoice **{name or client_name}** for?",
-                action="clarification_needed",
-            )
-
-        # No name at all — start from scratch
-        _manual_invoice_conversation = ManualInvoiceConversation(step="awaiting_customer")
-        return ChatResponse(
-            reply="Sure — let's create a new invoice.\n\n👤 Who is it for? (name, or name + email for a new client)",
-            action="clarification_needed",
+        _manual_invoice_conversation = ManualInvoiceConversation(
+            step="awaiting_customer",
+            client_name=client_name,
+            client_email=client_email,
+            currency=currency,
+            pending_item_name=item_name,
+            pending_item_description=item_desc,
+            pending_item_amount=item_amount,
+            item_count=1
         )
+        return await _advance_manual_invoice_conversation(db)
+
+    if action == "create_estimate":
+        parsed = await extract_manual_invoice_request(message, is_estimate=True)
+
+        client_name = parsed.get("client_name") or person_name
+        client_email = parsed.get("client_email")
+        currency = parsed.get("currency") or "INR"
+        
+        # Pull first item details if present in parsed payload
+        item_name = None
+        item_desc = None
+        item_amount = None
+        
+        parsed_items = parsed.get("items") or []
+        if parsed_items:
+            first_item = parsed_items[0]
+            item_name = first_item.get("item_name")
+            item_desc = first_item.get("task_description") or item_name
+            item_amount = first_item.get("amount")
+
+        _manual_invoice_conversation = ManualInvoiceConversation(
+            step="awaiting_customer",
+            client_name=client_name,
+            client_email=client_email,
+            currency=currency,
+            pending_item_name=item_name,
+            pending_item_description=item_desc,
+            pending_item_amount=item_amount,
+            item_count=1,
+            is_estimate=True,
+        )
+        return await _advance_manual_invoice_conversation(db)
+
+    if action in ("accept_estimate", "reject_estimate", "convert_estimate", "create_estimate"):
+        # Clear any stale disambiguation so a fresh command starts clean
+        _pending_estimate_disambiguations.pop(session_key, None)
+
+    if action == "accept_estimate":
+        estimate_ref: Optional[str] = intent.get("estimate_ref") or None
+        return await _handle_accept_estimate(person_name, estimate_ref, db, session_key)
+
+    if action == "reject_estimate":
+        estimate_ref_rej: Optional[str] = intent.get("estimate_ref") or None
+        return await _handle_reject_estimate(person_name, estimate_ref_rej, db, session_key)
+
+    if action == "convert_estimate":
+        return await _handle_convert_estimate(person_name, db, session_key)
 
     # ── Handle "send invoice(s)" intent ─────────────────────────────────────
     if action == "send_invoices":
@@ -1292,6 +2395,23 @@ async def process_chat(
     if action in ("check_overdue", "check_pending", "check_specific_payment", "payment_summary"):
         return await _handle_payment_query(action, person_name, db, emit=emit)
 
+    # ── Payment reminders ────────────────────────────────────────────────────
+    if action == "remind_overdue":
+        days_overdue_min = int(intent.get("days_overdue_min") if intent.get("days_overdue_min") is not None else 0)
+        return await _handle_remind_overdue(person_name, days_overdue_min, db, emit=emit)
+
+    # ── Record payment ───────────────────────────────────────────────────────
+    if action == "record_payment":
+        amount = intent.get("amount")
+        payment_mode = intent.get("payment_mode") or "banktransfer"
+        payment_date = intent.get("payment_date")
+        if not payment_date:
+            from datetime import date as _date
+            payment_date = _date.today().isoformat()
+        return await _handle_record_payment(
+            person_name, amount, payment_mode, payment_date, db, session_key=session_key, emit=emit
+        )
+
     # ── Recurring invoice intents ────────────────────────────────────────────
     if action == "list_recurring":
         return await _handle_recurring_list(db, emit, session_key)
@@ -1347,9 +2467,9 @@ async def process_chat(
         return ChatResponse(
             reply=(
                 "I need a bit more to go on! Try something like:\n"
-                "• *\"Invoice Piyusha for yesterday's work\"*\n"
-                "• *\"Check emails from last Sunday\"*\n"
-                "• *\"Make an invoice for Rahul for the website project\"*"
+                "• Invoice Piyusha for yesterday's work\n"
+                "• Check emails from last Sunday\n"
+                "• Make an invoice for Rahul for the website project"
             ),
             action="clarification_needed",
         )
@@ -1820,6 +2940,12 @@ async def approve_draft(draft_id: str, overrides: dict, db: AsyncSession) -> Cha
                 f"Want me to send it to them? Just say *\"send the invoice\"*."
             )
 
+        # Force cache refresh to keep stats/dashboard in sync
+        try:
+            await ensure_fresh_cache(db, force=True)
+        except Exception as cache_err:
+            logger.error(f"Failed to force refresh cache after invoice approval: {cache_err}")
+
         return ChatResponse(
             reply=reply,
             action="invoice_created",
@@ -1985,6 +3111,12 @@ async def approve_batch(
             else:
                 reply = f"Saved {len(created_invoices_list)} individual invoices for **{batch.client_name}** as drafts. 💾"
                 
+        # Force cache refresh to keep stats/dashboard in sync
+        try:
+            await ensure_fresh_cache(db, force=True)
+        except Exception as cache_err:
+            logger.error(f"Failed to force refresh cache after batch invoice approval: {cache_err}")
+
         return ChatResponse(
             reply=reply,
             action="invoice_created",
@@ -2047,14 +3179,21 @@ async def approve_manual_invoice(
             for item in draft.line_items
         ]
 
-        invoice = await create_invoice(
-            contact_id=contact_id,
-            task_description="",
-            amount=0.0,
-            currency=draft.currency or "INR",
-            db=db,
-            line_items=line_items_payload,
-        )
+        if draft.estimate_id:
+            invoice = await convert_estimate_to_invoice(
+                estimate_id=draft.estimate_id,
+                db=db,
+                line_items=line_items_payload,
+            )
+        else:
+            invoice = await create_invoice(
+                contact_id=contact_id,
+                task_description="",
+                amount=0.0,
+                currency=draft.currency or "INR",
+                db=db,
+                line_items=line_items_payload,
+            )
 
         email_sent = False
         if send_email:
@@ -2090,6 +3229,12 @@ async def approve_manual_invoice(
                 f"{created.currency} {created.amount:,.2f} ✅"
             )
 
+        # Force cache refresh to keep stats/dashboard in sync
+        try:
+            await ensure_fresh_cache(db, force=True)
+        except Exception as cache_err:
+            logger.error(f"Failed to force refresh cache after manual invoice approval: {cache_err}")
+
         return ChatResponse(
             reply=reply,
             action="invoice_created",
@@ -2098,3 +3243,249 @@ async def approve_manual_invoice(
     except Exception as e:
         logger.error(f"Failed to create manual invoice {draft_id}: {e}")
         return ChatResponse(reply=f"Failed to create manual invoice: {e}", action="error")
+
+
+
+async def multi_estimate_action(
+    estimate_ids: list[str],
+    mode: str,  # "accept" | "reject" | "convert"
+    db: AsyncSession,
+) -> ChatResponse:
+    """
+    Apply accept / reject / convert to multiple estimates at once.
+    Returns a summary ChatResponse with counts.
+    """
+    succeeded: list[str] = []
+    failed: list[str] = []
+    convert_drafts: list[ManualInvoiceDraft] = []
+
+    for eid in estimate_ids:
+        try:
+            if mode in ("accept", "reject"):
+                zoho_status = "accepted" if mode == "accept" else "declined"
+                updated = await update_estimate_status(eid, zoho_status, db)
+                _mark_estimate_status(eid, zoho_status)
+                succeeded.append(updated.get("estimate_number") or eid)
+
+            elif mode == "convert":
+                details = await get_estimate(eid, db)
+                status = (details.get("status") or "").lower()
+                if status in ("invoiced", "partially_invoiced"):
+                    failed.append(f"#{details.get('estimate_number')} (already invoiced)")
+                    continue
+                draft = await _build_invoice_draft_from_estimate(details)
+                convert_drafts.append(draft)
+                succeeded.append(details.get("estimate_number") or eid)
+        except Exception as e:
+            logger.error(f"multi_estimate_action: {mode} {eid} failed: {e}")
+            failed.append(eid)
+
+    if mode == "convert" and convert_drafts:
+        # For convert: return the first draft for approval
+        # (converting multiple at once just queues first; user can repeat)
+        if len(convert_drafts) == 1:
+            d = convert_drafts[0]
+            reply = f"Here is the draft invoice from the selected estimate for **{d.client_name}**. Approve below to create it:"
+            return ChatResponse(reply=reply, action="manual_invoice_pending", manual_invoice_draft=d)
+        # Multiple converts — return each draft card
+        # For now return first one with a note
+        d = convert_drafts[0]
+        reply = (
+            f"I've queued **{len(convert_drafts)}** estimate conversions. "
+            f"Showing the first one for **{d.client_name}** — approve it, then I'll show the next."
+        )
+        return ChatResponse(reply=reply, action="manual_invoice_pending", manual_invoice_draft=d)
+
+    if mode == "accept":
+        verb = "accepted"
+        emoji = "✅"
+    else:
+        verb = "declined"
+        emoji = "✗"
+
+    parts = []
+    if succeeded:
+        nums = ", ".join(f"**#{n}**" for n in succeeded)
+        parts.append(f"{emoji} {len(succeeded)} estimate(s) {verb}: {nums}")
+    if failed:
+        parts.append(f"⚠️ {len(failed)} could not be processed: {', '.join(failed)}")
+
+    reply = "\n".join(parts) if parts else "No estimates were processed."
+    action = f"estimate_{verb}" if succeeded else "error"
+    return ChatResponse(reply=reply, action=action)
+
+
+async def approve_estimate_draft(
+
+    draft_id: str,
+    send_email: bool,
+    db: AsyncSession,
+    client_name: str | None = None,
+    client_email: str | None = None,
+    line_items: list | None = None,
+) -> ChatResponse:
+    draft = _pending_estimate_drafts.get(draft_id)
+    if not draft:
+        return ChatResponse(
+            reply="This estimate draft has expired or was already processed.",
+            action="error",
+        )
+
+    # Apply any edits the user made in the confirmation card
+    if client_name:
+        draft.client_name = client_name.strip()
+    if client_email is not None:
+        draft.client_email = client_email.strip() or None
+    if line_items:
+        draft.line_items = [
+            EstimateLineItem(
+                item_name=li.get("item_name", "Service") if isinstance(li, dict) else li.item_name,
+                description=li.get("description", "") if isinstance(li, dict) else li.description,
+                amount=float(li.get("amount", 0)) if isinstance(li, dict) else float(li.amount),
+            )
+            for li in line_items
+        ]
+
+    contact_id = draft.zoho_contact_id
+    try:
+        if not contact_id:
+            if not draft.client_name:
+                return ChatResponse(reply="Missing client name for this estimate.", action="error")
+            contact_id = await create_contact(draft.client_name, draft.client_email, db)
+            draft.zoho_contact_id = contact_id
+        elif draft.client_email:
+            asyncio.create_task(update_contact_email(contact_id, draft.client_email, db))
+
+        total_amount = sum(item.amount for item in draft.line_items)
+        line_items_payload = [
+            {
+                "name": item.item_name,
+                "description": item.description,
+                "rate": item.amount,
+                "quantity": 1,
+            }
+            for item in draft.line_items
+        ]
+
+        estimate = await create_estimate(
+            customer_id=contact_id,
+            line_items=line_items_payload,
+            currency=draft.currency or "INR",
+            db=db,
+        )
+
+        email_sent = False
+        if send_email:
+            email_sent, _ = await send_estimate_email(
+                estimate.get("estimate_id", ""),
+                db,
+                to_email=draft.client_email,
+            )
+
+        created = CreatedEstimate(
+            zoho_estimate_id=estimate.get("estimate_id", ""),
+            estimate_number=estimate.get("estimate_number", ""),
+            client_name=draft.client_name,
+            client_email=draft.client_email,
+            amount=total_amount,
+            currency=draft.currency or "INR",
+            estimate_url=estimate.get("estimate_url"),
+            email_sent=email_sent,
+        )
+        _pending_estimate_drafts.pop(draft_id, None)
+
+        if send_email and email_sent:
+            reply = f"Estimate **#{created.estimate_number}** created and sent to **{draft.client_name}**. 📧"
+        elif send_email and not email_sent:
+            reply = (
+                f"Estimate **#{created.estimate_number}** created for **{draft.client_name}**, "
+                "but I couldn't send the email automatically."
+            )
+        else:
+            reply = (
+                f"Estimate **#{created.estimate_number}** created for **{draft.client_name}** — "
+                f"{created.currency} {created.amount:,.2f} ✅"
+            )
+
+        # Force cache refresh to keep stats/dashboard in sync
+        try:
+            await ensure_fresh_cache(db, force=True)
+        except Exception as cache_err:
+            logger.error(f"Failed to force refresh cache after manual estimate approval: {cache_err}")
+
+        return ChatResponse(
+            reply=reply,
+            action="estimate_created",
+            estimates_created=[created],
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to process estimate {draft_id}: {e}")
+        return ChatResponse(reply=f"Failed to process estimate: {e}", action="error")
+
+
+async def approve_payment_record(draft_id: str, overrides: dict, db: AsyncSession) -> ChatResponse:
+    """Record payment in Zoho from approved draft."""
+    draft = _pending_payment_drafts.get(draft_id)
+    if not draft:
+        return ChatResponse(
+            reply="This payment draft has expired or was already recorded. Please try again.",
+            action="error",
+        )
+
+    amount = float(overrides.get("amount") or draft.amount)
+    payment_date = overrides.get("payment_date") or draft.payment_date
+    payment_mode = overrides.get("payment_mode") or draft.payment_mode
+
+    try:
+        # Step 1: Write to Zoho customer payments
+        payment_info = await record_payment(
+            customer_id=draft.customer_id,
+            invoice_id=draft.invoice_id,
+            amount=amount,
+            payment_date=payment_date,
+            payment_mode=payment_mode,
+            db=db,
+        )
+
+        # Step 2: Pop from memory store ONLY after API call succeeds
+        _pending_payment_drafts.pop(draft_id, None)
+
+        # Step 3: Update local DB cache (InvoiceCache)
+        res = await db.execute(
+            select(InvoiceCache).where(InvoiceCache.invoice_id == draft.invoice_id)
+        )
+        row = res.scalar()
+        if row:
+            new_balance = float(row.balance) - amount
+            row.balance = max(0.0, round(new_balance, 2))
+            if row.balance == 0:
+                row.status = "paid"
+            else:
+                row.status = "partially_paid"
+            await db.commit()
+
+        currency_sym = "₹" if draft.currency == "INR" else f"{draft.currency} "
+        reply = (
+            f"✅ Offline payment of **{currency_sym}{amount:,.2f}** recorded successfully in Zoho "
+            f"against invoice **#{draft.invoice_id}** (Method: {payment_mode.upper()}, Date: {payment_date})."
+        )
+
+        # Force cache refresh to keep stats/dashboard in sync
+        try:
+            await ensure_fresh_cache(db, force=True)
+        except Exception as cache_err:
+            logger.error(f"Failed to force refresh cache after payment recording: {cache_err}")
+
+        return ChatResponse(
+            reply=reply,
+            action="payment_recorded",
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to record manual payment: {e}")
+        return ChatResponse(
+            reply=f"⚠️ Failed to record payment in Zoho: {e}",
+            action="error",
+        )
+

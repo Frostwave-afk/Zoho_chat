@@ -299,6 +299,322 @@ function cancelManualInvoice(draftId) {
   appendAgentMessage('Invoice cancelled. Let me know if you need anything else.');
 }
 
+
+function buildEstimateCard(draft) {
+  const card = document.createElement('div');
+  card.className = 'draft-card manual-invoice-card estimate-card' + (draft.is_new_contact ? ' new-contact-card' : '');
+  card.id = `estimate-draft-${draft.draft_id}`;
+
+  const badge = draft.is_new_contact
+    ? `<span class="draft-badge new-contact-badge">👤 New Contact + Estimate</span>`
+    : `<span class="draft-badge">Estimate Draft</span>`;
+
+  const itemsHtml = draft.line_items.map((item, idx) => `
+    <div class="manual-item-row" id="estimate-item-row-${draft.draft_id}-${idx}">
+      <div class="manual-item-header">
+        <span class="manual-item-label">Item ${idx + 1}</span>
+      </div>
+      <div class="draft-fields manual-item-fields">
+        <div class="draft-field">
+          <label>Service / Name</label>
+          <input type="text"
+            class="estimate-item-name"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${escapeHtml(item.item_name)}"
+            placeholder="e.g. Website Redesign" />
+        </div>
+        <div class="draft-field">
+          <label>Description</label>
+          <input type="text"
+            class="estimate-item-desc"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${escapeHtml(item.description || '')}"
+            placeholder="Full description" />
+        </div>
+        <div class="draft-field draft-field-amount">
+          <label>Amount (${escapeHtml(draft.currency || 'INR')})</label>
+          <input type="number"
+            class="estimate-item-amount"
+            data-draft="${draft.draft_id}" data-idx="${idx}"
+            value="${Number(item.amount)}"
+            placeholder="0"
+            oninput="recalcEstimateTotal('${draft.draft_id}')" />
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  card.innerHTML = `
+    <div class="draft-header">
+      ${badge}
+      <span class="draft-subject">${escapeHtml(draft.client_name)}</span>
+    </div>
+    <div class="draft-fields">
+      <div class="draft-field">
+        <label>Client Name</label>
+        <input type="text" id="estimate-client-name-${draft.draft_id}"
+          value="${escapeHtml(draft.client_name || '')}"
+          placeholder="Client name" />
+      </div>
+      <div class="draft-field">
+        <label>Email</label>
+        <input type="email" id="estimate-client-email-${draft.draft_id}"
+          value="${escapeHtml(draft.client_email || '')}"
+          placeholder="client@example.com" />
+      </div>
+    </div>
+    <div class="manual-items-section">
+      ${itemsHtml}
+    </div>
+
+    <div class="draft-actions">
+      <button class="btn-approve ${draft.is_new_contact ? 'btn-new-contact' : ''}"
+        id="estimate-approve-${draft.draft_id}"
+        onclick="approveEstimate('${draft.draft_id}', false)">
+        ${draft.is_new_contact ? '👤 Create Contact & Estimate' : '✓ Create Estimate'}
+      </button>
+      <button class="btn-approve-send"
+        id="estimate-approve-send-${draft.draft_id}"
+        onclick="approveEstimate('${draft.draft_id}', true)">
+        ${draft.is_new_contact ? '👤 Create Contact & Send' : '📧 Create & Send Estimate'}
+      </button>
+      <button class="btn-close-action" title="Cancel" onclick="cancelEstimate('${draft.draft_id}')">✕</button>
+    </div>`;
+  return card;
+}
+
+function recalcEstimateTotal(draftId) {
+  const amounts = document.querySelectorAll(`.estimate-item-amount[data-draft="${draftId}"]`);
+  const total = Array.from(amounts).reduce((s, el) => s + (parseFloat(el.value) || 0), 0);
+  const el = document.getElementById(`estimate-total-${draftId}`);
+  if (el) {
+    const cur = amounts[0]?.closest('.draft-field')?.querySelector('label')?.textContent?.match(/\(([^)]+)\)/)?.[1] || 'INR';
+    el.textContent = `${cur} ${total.toLocaleString('en-IN')}`;
+  }
+}
+
+function cancelEstimate(draftId) {
+  const card = document.getElementById(`estimate-draft-${draftId}`);
+  if (card) {
+    card.style.transition = 'opacity 0.25s, transform 0.25s';
+    card.style.opacity = '0';
+    card.style.transform = 'scale(0.97)';
+    setTimeout(() => card.remove(), 260);
+  }
+  appendAgentMessage('Estimate cancelled. Let me know if you need anything else.');
+}
+
+async function approveEstimate(draftId, sendEmail = false) {
+  const approveBtn = document.getElementById(`estimate-approve-${draftId}`);
+  const sendBtn    = document.getElementById(`estimate-approve-send-${draftId}`);
+  const activeBtn  = sendEmail ? sendBtn : approveBtn;
+
+  if (approveBtn) approveBtn.disabled = true;
+  if (sendBtn)    sendBtn.disabled    = true;
+  if (activeBtn)  activeBtn.textContent = sendEmail ? 'Sending…' : 'Processing…';
+
+  const clientName  = document.getElementById(`estimate-client-name-${draftId}`)?.value?.trim()  || '';
+  const clientEmail = document.getElementById(`estimate-client-email-${draftId}`)?.value?.trim() || '';
+
+  const nameInputs   = document.querySelectorAll(`.estimate-item-name[data-draft="${draftId}"]`);
+  const descInputs   = document.querySelectorAll(`.estimate-item-desc[data-draft="${draftId}"]`);
+  const amountInputs = document.querySelectorAll(`.estimate-item-amount[data-draft="${draftId}"]`);
+  const line_items = Array.from(nameInputs).map((el, i) => ({
+    item_name:        el.value.trim() || 'Service',
+    description:      descInputs[i]?.value?.trim() || el.value.trim(),
+    amount:           parseFloat(amountInputs[i]?.value) || 0,
+  }));
+
+  try {
+    const res = await fetch('/chat/estimate-approve', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        draft_id:     draftId,
+        send_email:   sendEmail,
+        client_name:  clientName,
+        client_email: clientEmail,
+        line_items,
+      }),
+    });
+    const data = await res.json();
+    document.getElementById(`estimate-draft-${draftId}`)?.remove();
+
+    let extra = null;
+    if (data.estimates_created?.length) {
+      extra = document.createDocumentFragment();
+      data.estimates_created.forEach(est => extra.appendChild(buildEstimateCreatedCard(est)));
+    }
+    appendAgentMessage(data.reply, extra);
+  } catch (err) {
+    console.error(err);
+    appendAgentMessage('Error approving estimate: ' + err.message);
+  }
+}
+
+function buildEstimateCreatedCard(est) {
+  const card = document.createElement('div');
+  card.className = 'invoice-card estimate-created-card';
+  card.id = `estimate-card-${est.zoho_estimate_id}`;
+  const viewBtn = est.estimate_url
+    ? `<a href="${est.estimate_url}" target="_blank" class="btn-view-invoice">View →</a>`
+    : '';
+  const sendBtn = est.email_sent
+    ? `<span class="invoice-sent-badge">📧 Sent</span>`
+    : `<button class="btn-send-invoice" onclick="sendEstimateEmailDirect('${est.zoho_estimate_id}', '${escapeHtml(est.client_name)}', this)">Send to Client</button>`;
+  card.innerHTML = `
+    <div class="invoice-icon">📄</div>
+    <div class="invoice-info">
+      <div class="invoice-number">Estimate #${escapeHtml(est.estimate_number || '—')}</div>
+      <div class="invoice-detail">${escapeHtml(est.client_name)} · ${est.currency} ${Number(est.amount).toLocaleString()}</div>
+    </div>
+    <div class="invoice-card-actions">
+      ${viewBtn}
+      ${sendBtn}
+    </div>`;
+  return card;
+}
+
+async function sendEstimateEmailDirect(estimateId, clientName, btnEl) {
+  btnEl.disabled    = true;
+  btnEl.textContent = 'Sending…';
+  try {
+    const res  = await fetch('/api/estimates/send', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ estimate_id: estimateId }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      btnEl.outerHTML = '<span class="invoice-sent-badge">📧 Sent</span>';
+      appendAgentMessage(`Estimate email sent successfully to ${clientName}.`);
+    } else {
+      throw new Error(data.error);
+    }
+    scrollToBottom();
+  } catch (e) {
+    btnEl.disabled    = false;
+    btnEl.textContent = 'Send to Client';
+    appendAgentMessage('Could not send the estimate — please try again.');
+    console.error(e);
+  }
+}
+
+function buildAmbiguousEstimatesCard(estimates, mode) {
+  const cardId = `est-pick-${Date.now()}`;
+  const card   = document.createElement('div');
+  card.className   = 'draft-card est-pick-card';
+  card.id          = cardId;
+  card.dataset.mode = mode || 'accept';
+
+  const statusColor = { sent:'#06b6d4', accepted:'#10b981', declined:'#ef4444', draft:'#64748b', invoiced:'#7c3aed' };
+  const statusIcon  = { sent:'📤', accepted:'✅', declined:'✗', draft:'📝', invoiced:'🧾' };
+
+  const itemsHtml = estimates.map((est, idx) => {
+    const amt = Number(est.amount).toLocaleString('en-IN', {
+      style: 'currency', currency: est.currency || 'INR', maximumFractionDigits: 0,
+    });
+    const st  = (est.status || 'sent').toLowerCase();
+    const clr = statusColor[st] || '#94a3b8';
+    const ico = statusIcon[st]  || '📄';
+    const stLabel = est.status ? est.status.charAt(0).toUpperCase() + est.status.slice(1) : 'Sent';
+    return `
+      <label class="est-pick-item" for="est-chk-${cardId}-${idx}">
+        <input type="checkbox" class="est-pick-chk" id="est-chk-${cardId}-${idx}"
+          data-est-id="${escapeHtml(est.estimate_id)}" data-card="${cardId}" checked />
+        <div class="est-pick-info">
+          <div class="est-pick-number">#${escapeHtml(est.estimate_number)}</div>
+          <div class="est-pick-customer">${escapeHtml(est.customer_name)}</div>
+        </div>
+        <div class="est-pick-right">
+          <span class="est-pick-amount">${escapeHtml(amt)}</span>
+          <span class="est-pick-badge" style="color:${clr};border-color:${clr}33;background:${clr}18;">${ico} ${stLabel}</span>
+        </div>
+      </label>`;
+  }).join('');
+
+  const modeLabel = { accept:'Accept', reject:'Decline', convert:'Convert to Invoice' }[card.dataset.mode] || 'Confirm';
+  const modeColor = { accept:'var(--success)', reject:'var(--error)', convert:'var(--primary)' }[card.dataset.mode] || 'var(--primary)';
+
+  card.innerHTML = `
+    <div class="est-pick-header">
+      <span class="draft-badge" style="background:rgba(124,58,237,0.15);color:#a78bfa;border-color:rgba(124,58,237,0.3);">📋 Select Estimates</span>
+      <label class="est-pick-select-all">
+        <input type="checkbox" id="est-all-${cardId}" checked onchange="toggleAllEstimates('${cardId}', this.checked)" />
+        <span>All</span>
+      </label>
+    </div>
+    <div class="est-pick-list">${itemsHtml}</div>
+    <div class="est-pick-actions">
+      <button class="btn-est-confirm" id="est-confirm-${cardId}"
+        style="background:${modeColor}"
+        onclick="confirmEstimateSelection('${cardId}')">
+        ✓ ${modeLabel} Selected
+      </button>
+    </div>`;
+
+  // Keep "All" checkbox in sync when individual boxes change
+  setTimeout(() => {
+    card.querySelectorAll('.est-pick-chk').forEach(chk => {
+      chk.addEventListener('change', () => {
+        const all    = [...card.querySelectorAll('.est-pick-chk')];
+        const allCbx = document.getElementById(`est-all-${cardId}`);
+        if (allCbx) allCbx.checked = all.every(c => c.checked);
+      });
+    });
+  }, 0);
+
+  return card;
+}
+
+function toggleAllEstimates(cardId, checked) {
+  document.querySelectorAll(`#${cardId} .est-pick-chk`).forEach(c => c.checked = checked);
+}
+
+async function confirmEstimateSelection(cardId) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+
+  const checked = [...card.querySelectorAll('.est-pick-chk:checked')];
+  if (!checked.length) {
+    appendAgentMessage('Please select at least one estimate first.');
+    return;
+  }
+
+  const estimateIds = checked.map(c => c.dataset.estId);
+  const mode        = card.dataset.mode || 'accept';
+  const btn         = document.getElementById(`est-confirm-${cardId}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Processing…'; }
+
+  try {
+    const res  = await fetch('/chat/multi-estimate-action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ estimate_ids: estimateIds, mode }),
+    });
+    const data = await res.json();
+    card.remove();
+    appendAgentMessage(data.reply);
+
+    if (data.manual_invoice_draft) {
+      const extra = document.createElement('div');
+      extra.className = 'extra-cards';
+      extra.appendChild(buildManualInvoiceCard(data.manual_invoice_draft));
+      chatMessages.appendChild(extra);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = '✓ Confirm'; }
+    appendAgentMessage('Could not process estimates — please try again.');
+  }
+}
+
+// Legacy compat for plain-text (Telegram) fallback
+function chooseEstimateIndex(idx) {
+  chatInput.value = String(idx);
+  sendMessage();
+}
+
 function buildManualInvoiceCard(draft) {
   const card = document.createElement('div');
   card.className = 'draft-card manual-invoice-card' + (draft.is_new_contact ? ' new-contact-card' : '');
@@ -456,6 +772,126 @@ async function submitRecurringApproval(confirm) {
   await sendMessage();
 }
 
+function buildPaymentRecordDraftCard(draft) {
+  const card = document.createElement('div');
+  card.className = 'payment-draft-card';
+  card.id = `payment-draft-${draft.draft_id}`;
+
+  const defaultMode = draft.payment_mode || 'banktransfer';
+  const modes = [
+    { value: 'banktransfer', label: 'Bank Transfer (UPI/NetBanking)' },
+    { value: 'cash', label: 'Cash' },
+    { value: 'check', label: 'Cheque' },
+    { value: 'creditcard', label: 'Credit Card' },
+    { value: 'bankremittance', label: 'Bank Remittance' },
+    { value: 'others', label: 'Others' }
+  ];
+  const options = modes.map(m => `<option value="${m.value}" ${m.value === defaultMode ? 'selected' : ''}>${escapeHtml(m.label)}</option>`).join('');
+
+  card.innerHTML = `
+    <div class="draft-header">💵 Record Payment Draft</div>
+    <div class="draft-fields">
+      <div class="draft-field">
+        <label>Client</label>
+        <div><strong>${escapeHtml(draft.customer_name)}</strong></div>
+      </div>
+      <div class="draft-field">
+        <label>Invoice ID</label>
+        <div><strong>#${escapeHtml(draft.invoice_id)}</strong></div>
+      </div>
+      <div class="draft-field">
+        <label>Amount (${escapeHtml(draft.currency)})</label>
+        <input type="number" step="0.01" class="draft-input" id="pay-amount-${draft.draft_id}" value="${draft.amount}">
+      </div>
+      <div class="draft-field">
+        <label>Payment Method</label>
+        <select class="draft-select" id="pay-mode-${draft.draft_id}">
+          ${options}
+        </select>
+      </div>
+      <div class="draft-field">
+        <label>Payment Date</label>
+        <input type="date" class="draft-input" id="pay-date-${draft.draft_id}" value="${escapeHtml(draft.payment_date)}">
+      </div>
+      <div class="overpayment-warning-msg" id="overpayment-warn-${draft.draft_id}" style="display: none; color: var(--warning); margin-top: 8px; font-size: 12px; font-weight: 500;">
+        ⚠️ Warning: Payment exceeds invoice balance. This creates an overpayment in Zoho.
+      </div>
+    </div>
+    <div class="draft-actions">
+      <button class="btn-approve" id="pay-confirm-btn-${draft.draft_id}" onclick="confirmPayment('${draft.draft_id}')">
+        ✓ Confirm Payment
+      </button>
+      <button class="btn-close-action" title="Cancel" onclick="cancelPaymentDraft('${draft.draft_id}')">✕</button>
+    </div>`;
+
+  const initialBalance = draft.amount;
+  setTimeout(() => {
+    const amtInput = document.getElementById(`pay-amount-${draft.draft_id}`);
+    const warnEl = document.getElementById(`overpayment-warn-${draft.draft_id}`);
+    if (amtInput && warnEl) {
+      const check = () => {
+        const val = parseFloat(amtInput.value);
+        if (!isNaN(val) && val > initialBalance) {
+          warnEl.style.display = 'block';
+        } else {
+          warnEl.style.display = 'none';
+        }
+      };
+      amtInput.addEventListener('input', check);
+      check();
+    }
+  }, 100);
+
+  return card;
+}
+
+function cancelPaymentDraft(draftId) {
+  const card = document.getElementById(`payment-draft-${draftId}`);
+  if (card) {
+    card.style.transition = 'opacity 0.25s, transform 0.25s';
+    card.style.opacity = '0';
+    card.style.transform = 'scale(0.97)';
+    setTimeout(() => card.remove(), 260);
+  }
+  appendAgentMessage('Payment recording cancelled.');
+}
+
+async function confirmPayment(draftId) {
+  const confirmBtn = document.getElementById(`pay-confirm-btn-${draftId}`);
+  if (confirmBtn) confirmBtn.disabled = true;
+
+  const amount = parseFloat(document.getElementById(`pay-amount-${draftId}`)?.value);
+  const paymentMode = document.getElementById(`pay-mode-${draftId}`)?.value;
+  const paymentDate = document.getElementById(`pay-date-${draftId}`)?.value;
+
+  if (confirmBtn) confirmBtn.textContent = 'Recording…';
+
+  try {
+    const res = await fetch('/chat/payment-approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        draft_id: draftId,
+        amount: isNaN(amount) ? undefined : amount,
+        payment_mode: paymentMode || undefined,
+        payment_date: paymentDate || undefined,
+      }),
+    });
+    const data = await res.json();
+    document.getElementById(`payment-draft-${draftId}`)?.remove();
+
+    appendAgentMessage(data.reply);
+    scrollToBottom();
+  } catch (e) {
+    if (confirmBtn) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm Payment';
+    }
+    console.error(e);
+    appendAgentMessage('Failed to record payment. Please try again.');
+  }
+}
+
 function appendExtraCards(extra, data) {
   if (data.recurring_draft) {
     extra.appendChild(buildRecurringInvoiceCard(data.recurring_draft));
@@ -463,6 +899,10 @@ function appendExtraCards(extra, data) {
   }
   if (data.manual_invoice_draft) {
     extra.appendChild(buildManualInvoiceCard(data.manual_invoice_draft));
+    return;
+  }
+  if (data.estimate_draft) {
+    extra.appendChild(buildEstimateCard(data.estimate_draft));
     return;
   }
   if (data.batch_draft) {
@@ -475,7 +915,58 @@ function appendExtraCards(extra, data) {
   }
   if (data.invoices_created?.length) {
     data.invoices_created.forEach(inv => extra.appendChild(buildInvoiceCard(inv)));
+    return;
   }
+  if (data.estimates_created?.length) {
+    data.estimates_created.forEach(est => extra.appendChild(buildEstimateCreatedCard(est)));
+    return;
+  }
+  if (data.payment_record_draft) {
+    extra.appendChild(buildPaymentRecordDraftCard(data.payment_record_draft));
+    return;
+  }
+  // Reminder result cards — rendered when payment_invoices come back from a remind_overdue action
+  if (data.payment_invoices?.length && data.action === 'invoice_sent') {
+    extra.appendChild(buildReminderSummaryCard(data.payment_invoices));
+  }
+  if (data.ambiguous_estimates?.length) {
+    extra.appendChild(buildAmbiguousEstimatesCard(data.ambiguous_estimates, data.disambiguation_mode || 'accept'));
+  }
+}
+
+/** Compact summary card for payment reminders sent. */
+function buildReminderSummaryCard(invoices) {
+  const card = document.createElement('div');
+  card.className = 'reminder-summary-card';
+
+  const rows = invoices.map(inv => {
+    const reminded = inv.last_reminded_at
+      ? `<span class="reminded-badge" title="Reminder sent">📧 Reminded</span>`
+      : '';
+    const overdueTxt = inv.days_overdue != null
+      ? `<span class="overdue-tag">${inv.days_overdue}d overdue</span>` : '';
+    const balance = Number(inv.balance || 0).toLocaleString('en-IN', { style: 'currency', currency: inv.currency_code || 'INR' });
+    const link = inv.zoho_view_url
+      ? `<a href="${inv.zoho_view_url}" target="_blank" class="reminder-view-link">View →</a>`
+      : '';
+    return `
+      <div class="reminder-row">
+        <div class="reminder-row-left">
+          <span class="reminder-name">${escapeHtml(inv.customer_name)}</span>
+          ${overdueTxt}
+        </div>
+        <div class="reminder-row-right">
+          <span class="reminder-balance">${escapeHtml(balance)}</span>
+          ${reminded}
+          ${link}
+        </div>
+      </div>`;
+  }).join('');
+
+  card.innerHTML = `
+    <div class="reminder-summary-header">📧 Reminders sent (${invoices.length})</div>
+    <div class="reminder-rows">${rows}</div>`;
+  return card;
 }
 
 /* ─── Send message (SSE streaming) ──────────────────────────────────────── */
@@ -531,7 +1022,15 @@ async function sendMessage() {
           removeStatusBubble();
           const data  = payload;
           let   extra = null;
-          if (data.manual_invoice_draft || data.batch_draft || data.drafts?.length || data.invoices_created?.length || data.recurring_draft) {
+          const hasCards = (
+            data.manual_invoice_draft || data.batch_draft ||
+            data.drafts?.length || data.invoices_created?.length ||
+            data.recurring_draft || data.payment_record_draft ||
+            data.estimate_draft || data.estimates_created?.length ||
+            data.ambiguous_estimates?.length ||
+            (data.payment_invoices?.length && data.action === 'invoice_sent')
+          );
+          if (hasCards) {
             extra = document.createDocumentFragment();
             appendExtraCards(extra, data);
           }
@@ -677,6 +1176,39 @@ async function sendInvoice(invoiceId, clientName, btnEl) {
     btnEl.disabled    = false;
     btnEl.textContent = 'Send to Client';
     appendAgentMessage('Could not send the invoice — please try again.');
+    console.error(e);
+  }
+}
+
+async function sendInvoiceFromTable(invoiceId, viewUrl, btnEl) {
+  btnEl.disabled = true;
+  btnEl.textContent = '…';
+  try {
+    const res = await fetch('/api/invoices/send', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ invoice_id: invoiceId }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    
+    // Update the status badge in the same row to "sent"
+    const row = btnEl.closest('tr');
+    if (row) {
+      const statusBadge = row.querySelector('.status-badge');
+      if (statusBadge) {
+        statusBadge.className = 'status-badge badge-sent';
+        statusBadge.innerHTML = '● sent';
+      }
+    }
+
+    // Replace the whole actions cell with just the View link
+    const cell = btnEl.closest('td');
+    if (cell) cell.innerHTML = `<a href="${escapeHtml(viewUrl)}" target="_blank" rel="noopener" class="tbl-link-btn">View →</a>`;
+  } catch (e) {
+    btnEl.disabled = false;
+    btnEl.textContent = 'Send';
+    btnEl.title = e.message || 'Failed to send';
     console.error(e);
   }
 }
@@ -850,9 +1382,10 @@ async function approveBatch(batchId, mode) {
    PAGE ROUTING
    ══════════════════════════════════════════════════════════════════════════ */
 
-let _chartRevenue = null;
-let _chartStatus  = null;
-let _currentPage  = 'chat';
+let _chartRevenue   = null;
+let _chartStatus    = null;
+let _chartCustomers = null;
+let _currentPage    = 'chat';
 
 function showPage(name) {
   _currentPage = name;
@@ -919,6 +1452,9 @@ async function loadInvoices(filter) {
     if (data.error) throw new Error(data.error);
 
     const invoices = data.invoices || [];
+    const batchContainer = document.getElementById('batch-send-container');
+    if (batchContainer) batchContainer.classList.add('hidden');
+
     if (!invoices.length) {
       tbody.innerHTML = '<tr class="table-empty"><td colspan="8">No invoices found.</td></tr>';
       return;
@@ -940,6 +1476,15 @@ async function loadInvoices(filter) {
       const invNum   = inv.invoice_number || inv.invoice_id || '—';
       const client   = inv.customer_name  || '—';
       const url      = inv.invoice_url    || '#';
+      const actions = status === 'draft'
+        ? `<div class="td-actions">
+             <button class="tbl-send-btn" 
+                     data-id="${escapeHtml(inv.invoice_id || inv.zoho_invoice_id || '')}"
+                     data-url="${escapeHtml(url)}"
+                     onclick="sendInvoiceFromTable('${escapeHtml(inv.invoice_id || inv.zoho_invoice_id || '')}', '${escapeHtml(url)}', this)">Send</button>
+             <a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="tbl-link-btn">View →</a>
+           </div>`
+        : `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="tbl-link-btn">View →</a>`;
       return `<tr>
         <td class="td-muted">${escapeHtml(String(invNum))}</td>
         <td><strong>${escapeHtml(String(client))}</strong></td>
@@ -948,13 +1493,64 @@ async function loadInvoices(filter) {
         <td><span class="status-badge ${badgeCls}">${dot} ${status}</span></td>
         <td class="td-muted">${escapeHtml(String(date))}</td>
         <td class="td-muted">${escapeHtml(String(due))}</td>
-        <td class="td-link"><a href="${escapeHtml(url)}" target="_blank" rel="noopener">View →</a></td>
+        <td class="td-link">${actions}</td>
       </tr>`;
     }).join('');
+
+    // If filter is 'draft' and there are invoices, show batch send button
+    if (filter === 'draft' && invoices.some(inv => (inv.status || '').toLowerCase() === 'draft') && batchContainer) {
+      batchContainer.classList.remove('hidden');
+    }
   } catch (e) {
+    const batchContainer = document.getElementById('batch-send-container');
+    if (batchContainer) batchContainer.classList.add('hidden');
     tbody.innerHTML = `<tr class="table-empty"><td colspan="8">⚠️ ${escapeHtml(e.message)}</td></tr>`;
   }
 }
+
+async function sendAllDraftInvoices() {
+  const btn = document.getElementById('btn-batch-send');
+  if (!btn) return;
+
+  const sendBtns = Array.from(document.querySelectorAll('#invoices-tbody .tbl-send-btn:not(:disabled)'));
+  if (!sendBtns.length) {
+    appendAgentMessage('No draft invoices to send.');
+    return;
+  }
+
+  btn.disabled = true;
+  const originalText = btn.innerHTML;
+  btn.innerHTML = `⏳ Sending 0 / ${sendBtns.length}…`;
+
+  let successCount = 0;
+  
+  // Send in parallel limit to avoid server strain, or just simple parallel
+  const promises = sendBtns.map(async (sendBtn) => {
+    const invoiceId = sendBtn.getAttribute('data-id');
+    const viewUrl = sendBtn.getAttribute('data-url');
+    if (!invoiceId) return;
+
+    const ok = await sendInvoiceFromTable(invoiceId, viewUrl, sendBtn);
+    if (ok) {
+      successCount++;
+      btn.innerHTML = `⏳ Sending ${successCount} / ${sendBtns.length}…`;
+    }
+  });
+
+  await Promise.all(promises);
+
+  btn.innerHTML = `✅ Sent ${successCount} invoices!`;
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.innerHTML = originalText;
+    // Refresh the invoices list (which will update the UI and hide the button)
+    const activeChip = document.querySelector('.filter-chips .chip.active');
+    if (activeChip) {
+      activeChip.click();
+    }
+  }, 2000);
+}
+
 
 async function loadRecurring() {
   const tbody = document.getElementById('recurring-tbody');
@@ -1117,6 +1713,102 @@ async function loadStats() {
                 callbacks: {
                   label: ctx => ` ${ctx.label}: ${ctx.raw} (${Math.round(ctx.raw / total * 100)}%)`
                 }
+              }
+            }
+          }
+        });
+      }
+    }
+
+    // ── Customer breakdown horizontal stacked bar chart ──────────────────
+    const customerBreakdown = data.customer_breakdown || [];
+    const sortedCustomers = customerBreakdown
+      .map(c => ({
+        ...c,
+        total: parseFloat(c.paid) + parseFloat(c.overdue) + parseFloat(c.sent)
+      }))
+      .filter(c => c.total > 0)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+
+    if (_chartCustomers) { _chartCustomers.destroy(); _chartCustomers = null; }
+    const ctxCust = document.getElementById('chart-customers');
+    if (ctxCust) {
+      // Remove any existing no-data message
+      const oldMsg = ctxCust.parentNode.querySelector('.no-cust-msg');
+      if (oldMsg) oldMsg.remove();
+
+      if (sortedCustomers.length === 0) {
+        ctxCust.style.display = 'none';
+        const msg = document.createElement('p');
+        msg.className = 'no-cust-msg';
+        msg.style.cssText = 'text-align:center;color:var(--text3);margin-top:40px;font-size:13px';
+        msg.textContent = 'No customer transactions found';
+        ctxCust.parentNode.appendChild(msg);
+      } else {
+        ctxCust.style.display = '';
+        _chartCustomers = new Chart(ctxCust, {
+          type: 'bar',
+          data: {
+            labels: sortedCustomers.map(c => c.customer_name),
+            datasets: [
+              {
+                label: 'Paid',
+                data: sortedCustomers.map(c => c.paid),
+                backgroundColor: 'rgba(16,185,129,0.7)',
+                borderColor: '#10b981',
+                borderWidth: 1.5
+              },
+              {
+                label: 'Sent (Unpaid)',
+                data: sortedCustomers.map(c => c.sent),
+                backgroundColor: 'rgba(59,130,246,0.7)',
+                borderColor: '#3b82f6',
+                borderWidth: 1.5
+              },
+              {
+                label: 'Overdue',
+                data: sortedCustomers.map(c => c.overdue),
+                backgroundColor: 'rgba(239,68,68,0.7)',
+                borderColor: '#ef4444',
+                borderWidth: 1.5
+              }
+            ]
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'top',
+                labels: { color: '#94a3b8', font: { size: 11 } }
+              },
+              tooltip: {
+                backgroundColor: 'rgba(15,15,26,0.95)',
+                titleColor: '#94a3b8',
+                bodyColor: '#f1f5f9',
+                borderColor: 'rgba(255,255,255,0.08)',
+                borderWidth: 1,
+                callbacks: {
+                  label: ctx => ` ${ctx.dataset.label}: ${formatCurrency(ctx.raw)}`
+                }
+              }
+            },
+            scales: {
+              x: {
+                stacked: true,
+                grid: { color: 'rgba(255,255,255,0.05)' },
+                ticks: {
+                  color: '#64748b',
+                  font: { size: 10 },
+                  callback: v => '₹' + (v >= 1000 ? (v/1000).toFixed(0) + 'k' : v)
+                }
+              },
+              y: {
+                stacked: true,
+                grid: { display: false },
+                ticks: { color: '#94a3b8', font: { size: 11 } }
               }
             }
           }

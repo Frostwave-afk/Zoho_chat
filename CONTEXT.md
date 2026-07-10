@@ -214,11 +214,16 @@ Caches Zoho contact lookups (name → contact_id + email). TTL = 24 hours.
 - `zoho_contact_id`, `zoho_email`, `cached_at`
 
 ### `invoice_cache`
-Snapshot of Zoho invoices for payment-status queries. Refreshed every 15 minutes on demand.
+Snapshot of Zoho invoices for payment-status queries and dashboard stats. Refreshed on demand (15 minutes TTL) or instantly upon write.
 - `invoice_id` (PK)
-- `customer_name`, `status`, `due_date`, `balance`, `total`, `currency_code`
-- `zoho_view_url`, `last_synced`
-- Statuses synced: `overdue`, `sent`, `partially_paid`, `paid`
+- `customer_name`, `status`, `due_date`, `invoice_date`, `last_payment_date`, `balance`, `total`, `currency_code`
+- `zoho_view_url`, `last_synced`, `last_reminded_at`
+- Statuses synced: `overdue`, `sent`, `partially_paid`, `paid`, `unpaid`
+
+### `recurring_cache`
+Snapshot of active recurring invoice profiles to drive dashboard KPI metrics and lists without querying the live Zoho API on every view.
+- `profile_id` (PK)
+- `customer_name`, `status`, `amount`, `last_synced`
 
 ---
 
@@ -351,7 +356,11 @@ approve_manual_invoice(draft_id, send_email, db)
 - `_pending_drafts: dict[str, DraftInvoice]` — draft cards awaiting user approval
 - `_pending_batches: dict[str, BatchDraft]` — grouped drafts for same-contact batch processing
 - `_pending_manual_invoice_drafts: dict[str, ManualInvoiceDraft]` — manual invoice previews awaiting approval
-- `_manual_invoice_conversation: Optional[ManualInvoiceConversation]` — active manual invoice chat flow
+- `_pending_estimate_drafts: dict[str, EstimateDraft]` — manual estimate previews awaiting approval
+- `_manual_invoice_conversation: Optional[ManualInvoiceConversation]` — active manual invoice/estimate chat flow
+- `_pending_recurring_conv: dict[str | int, RecurringConversation]` — active recurring invoice chat flow
+- `_pending_recurring_list: dict[str | int, list[dict]]` — active recurring profiles cache for stop-by-number
+- `_pending_estimate_disambiguations: dict[str | int, dict]` — matching accepted estimates for selection
 - `_recent_invoices: deque[CreatedInvoice]` (maxlen=20) — invoices created this session, used for "send the invoice" intent
 
 ---
@@ -417,7 +426,7 @@ Single-page chat app. No framework, no build step.
 
 5. **Draft approval is also in-memory.** `_pending_drafts` is cleared on restart — stale draft IDs from the frontend will get an "expired" error.
 
-6. **Batch and manual invoice previews are also in-memory.** `_pending_batches`, `_pending_manual_invoice_drafts`, and `_manual_invoice_conversation` are all lost on restart.
+6. **Batch, manual invoice, and payment record previews are also in-memory.** `_pending_batches`, `_pending_manual_invoice_drafts`, `_pending_payment_drafts`, and `_manual_invoice_conversation` are all lost on restart.
 
 7. **Email deduplication.** Once a Gmail message ID is in `processed_emails`, it won't produce a draft again. Clear the table to re-process (see run command).
 
@@ -430,6 +439,12 @@ Single-page chat app. No framework, no build step.
 11. **Rate limiting.** A 1.5-second sleep between consecutive Groq calls when processing multiple emails. If rate-limited, the error is surfaced immediately as a chat reply.
 
 12. **Contact cache TTL = 24 hours.** Zoho contact lookups are cached by lowercase name. Email-based Zoho lookup also checks cached rows by `zoho_email` before hitting the API.
+
+13. **Payment reminder endpoint quirks.** The bulk reminder endpoint is `POST /invoices/paymentreminder` (not `/bulk_invoice_reminder`). Invoice IDs are passed as a comma-separated **query parameter** `invoice_ids` (not a JSON body). Max 10 IDs per call — callers must chunk. The endpoint also requires `organization_id` as a query param AND the `X-com-zoho-invoice-organizationid` header (same dual-send pattern as gotcha #2). Partial failures are reported in `response["info"]["email_errors_info"]` as a list of `{ids, message}` — only update `last_reminded_at` for IDs **not** present in this error list.
+
+14. **Customer payments endpoint (/customerpayments)**: When recording manual payments via the API, the standard Zoho `payment_mode` enum includes `cash`, `check`, `creditcard`, `banktransfer`, `bankremittance`, `others`. Because `upi` is not natively supported as a manual payment_mode string, it is mapped to `"banktransfer"` in Zoho. All balance arithmetic updates must be rounded to 2 decimal places to avoid floating point precision issues.
+
+15. **Estimates endpoint quirks**: Estimates v3 endpoints (including `GET /estimates`, `GET /estimates/{id}`, `POST /estimates`, and `POST /estimates/{id}/email`) require the `organization_id` query parameter on every request. Status filtering for listing estimates uses `filter_by=Status.Accepted` (not `status=accepted`). When an estimate has been successfully converted into an invoice, Zoho automatically sets its status field to `"invoiced"`.
 
 ---
 
@@ -447,6 +462,13 @@ Single-page chat app. No framework, no build step.
 | `POST` | `/chat/approve` | Approve a draft → `ApproveRequest` → `ChatResponse` |
 | `POST` | `/chat/batch-approve` | Approve a batch draft |
 | `POST` | `/chat/manual-approve` | Approve a manual invoice draft |
+| `POST` | `/chat/estimate-approve` | Approve a manual estimate draft |
+| `POST` | `/chat/payment-approve` | Approve a manual payment record draft |
+| `GET` | `/api/invoices` | Return all invoices, optionally filtered by status |
+| `GET` | `/api/invoices/recurring` | Return all active recurring invoices |
+| `POST` | `/api/invoices/send` | Send an existing invoice to the client via Zoho email API |
+| `POST` | `/api/estimates/send` | Send an existing estimate to the client via Zoho email API |
+| `GET` | `/api/stats` | Return invoice statistics, revenue history, and customer breakdown |
 
 ---
 
@@ -458,7 +480,7 @@ ChatRequest(message: str)
 ApproveRequest(draft_id, item_name?, task_description?, amount?, currency?,
                client_name?, client_email?, send_email: bool = False)
 BatchApproveRequest(batch_draft_id, mode, selected_item_ids[], send_email=False)
-ManualInvoiceApproveRequest(draft_id, send_email: bool = False)
+ManualInvoiceApproveRequest(draft_id, send_email: bool = False, client_name?, client_email?, line_items?)
 
 # Internal
 InvoiceData(is_confirmation, client_name?, client_email?, item_name?,
@@ -475,6 +497,9 @@ ManualInvoiceLineItem(item_name, task_description, amount)
 ManualInvoiceDraft(draft_id, client_name, client_email?, currency="USD",
                    zoho_contact_id?, is_new_contact=False, line_items[])
 
+RecurringConversation(session_key, step, client_name?, client_email?, item_name?,
+                      amount?, currency?, frequency?, start_date?, zoho_contact_id?)
+
 CreatedInvoice(zoho_invoice_id, invoice_number, client_name, client_email?,
                amount, currency, invoice_url?, email_sent=False)
 
@@ -483,7 +508,7 @@ PaymentInvoice(invoice_id, customer_name, status, due_date?, balance,
 
 # Outbound
 ChatResponse(reply, action, drafts?, batch_draft?, manual_invoice_draft?,
-             invoices_created?, payment_invoices?, ambiguous_contacts?)
+             invoices_created?, payment_invoices?, ambiguous_contacts?, recurring_draft?)
 # action values: invoice_created | draft_pending | batch_pending |
 #                manual_invoice_pending | payment_status |
 #                invoice_sent | emails_scanned | clarification_needed | error

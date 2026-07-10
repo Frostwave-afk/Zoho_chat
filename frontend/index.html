@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=13" />
+  <link rel="stylesheet" href="/static/style.css?v=20" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 
@@ -231,6 +231,11 @@
             </tbody>
           </table>
         </div>
+        <div id="batch-send-container" class="batch-send-container hidden">
+          <button id="btn-batch-send" class="btn-batch-send" onclick="sendAllDraftInvoices()">
+            📧 Send All Draft Invoices
+          </button>
+        </div>
       </div>
 
       <!-- Recurring Tab -->
@@ -327,12 +332,21 @@
             <canvas id="chart-status"></canvas>
           </div>
         </div>
+
+        <div class="chart-card chart-full-width">
+          <div class="chart-card-header">
+            <span class="chart-title">Customer Balance Breakdown (Paid vs Overdue vs Sent)</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-customers"></canvas>
+          </div>
+        </div>
       </div>
     </main>
 
   </div><!-- /chat-screen -->
 
-  <script src="/static/app.js?v=14"></script>
+  <script src="/static/app.js?v=20"></script>
 </body>
 
 </html>

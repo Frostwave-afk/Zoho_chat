@@ -1099,18 +1099,48 @@ html, body {
 
 .td-amount { font-weight: 600; font-feature-settings: "tnum"; }
 .td-muted  { color: var(--text2); }
-.td-link a {
-  color: var(--primary-h);
+.td-link a, .tbl-link-btn, .tbl-send-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   text-decoration: none;
   font-size: 12px;
   font-weight: 500;
-  padding: 4px 10px;
-  border: 1px solid rgba(124,58,237,0.35);
+  font-family: inherit;
+  height: 28px;
+  padding: 0 12px;
   border-radius: 6px;
-  background: rgba(124,58,237,0.08);
   transition: background var(--transition);
+  cursor: pointer;
+  white-space: nowrap;
+  box-sizing: border-box;
+  vertical-align: middle;
 }
-.td-link a:hover { background: rgba(124,58,237,0.18); }
+
+/* View button — purple */
+.td-link a, .tbl-link-btn {
+  color: var(--primary-h);
+  border: 1px solid rgba(124,58,237,0.35);
+  background: rgba(124,58,237,0.08);
+}
+.td-link a:hover, .tbl-link-btn:hover { background: rgba(124,58,237,0.18); }
+
+/* Send button — green */
+.tbl-send-btn {
+  color: var(--success);
+  border: 1px solid rgba(16,185,129,0.4);
+  background: rgba(16,185,129,0.1);
+}
+.tbl-send-btn:hover:not(:disabled) { background: rgba(16,185,129,0.2); }
+.tbl-send-btn:disabled             { opacity: 0.55; cursor: not-allowed; }
+
+/* Actions cell with buttons side-by-side */
+.td-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
 
 /* Frequency badge */
 .freq-badge {
@@ -1195,3 +1225,271 @@ html, body {
 .chart-title { font-size: 13px; font-weight: 600; color: var(--text); }
 .chart-container { flex: 1; position: relative; min-height: 220px; }
 .chart-donut-container { min-height: 220px; max-height: 260px; }
+
+/* Batch Send Drafts Button */
+.batch-send-container {
+  display: flex;
+  justify-content: center;
+  margin-top: 20px;
+  margin-bottom: 20px;
+  animation: fadeUp 0.3s ease both;
+}
+.btn-batch-send {
+  background: var(--success);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 10px 24px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.15);
+  transition: transform var(--transition), background var(--transition), opacity var(--transition);
+}
+.btn-batch-send:hover:not(:disabled) {
+  background: #059669;
+  transform: translateY(-1px);
+}
+.btn-batch-send:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.chart-full-width {
+  grid-column: 1 / -1;
+}
+
+/* ─── Reminder Summary Card ─────────────────────────────────────────────── */
+/* ─── Estimate Multi-Select Pick Card ──────────────────────────────────── */
+.est-pick-card {
+  border-color: rgba(124,58,237,0.3);
+  background: rgba(124,58,237,0.04);
+  padding: 0;
+  overflow: hidden;
+}
+
+.est-pick-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.est-pick-select-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  cursor: pointer;
+  user-select: none;
+}
+.est-pick-select-all input[type="checkbox"] { cursor: pointer; }
+
+.est-pick-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.est-pick-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--transition);
+  user-select: none;
+}
+.est-pick-item:last-child { border-bottom: none; }
+.est-pick-item:hover { background: rgba(255,255,255,0.03); }
+.est-pick-item input[type="checkbox"] {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+.est-pick-info { flex: 1; min-width: 0; }
+.est-pick-number {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text);
+}
+.est-pick-customer {
+  font-size: 12px;
+  color: var(--text2);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.est-pick-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.est-pick-amount {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text);
+}
+.est-pick-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+
+.est-pick-actions {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+}
+
+.btn-est-confirm {
+  width: 100%;
+  padding: 11px;
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity var(--transition), transform var(--transition);
+}
+.btn-est-confirm:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+.btn-est-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.reminder-summary-card {
+
+  background: rgba(124, 58, 237, 0.08);
+  border: 1px solid rgba(124, 58, 237, 0.25);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin: 8px 0 4px 0;
+  max-width: 520px;
+  animation: slideIn 0.25s ease;
+}
+
+.reminder-summary-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--primary-h);
+  margin-bottom: 10px;
+  letter-spacing: 0.01em;
+}
+
+.reminder-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.reminder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  background: rgba(255,255,255,0.04);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+
+.reminder-row-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.reminder-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.overdue-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+.reminder-row-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.reminder-balance {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.reminded-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--success);
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-radius: 6px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+.reminder-view-link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  opacity: 0.85;
+  transition: opacity var(--transition);
+}
+.reminder-view-link:hover { opacity: 1; }
+
+/* ─── Payment Record Draft Card ─────────────────────────────────────────── */
+.payment-draft-card {
+  background: rgba(124, 58, 237, 0.03);
+  border: 1px solid rgba(124, 58, 237, 0.25);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 14px;
+  animation: msgIn 0.3s ease both;
+  max-width: 520px;
+}
+
+.payment-draft-card .draft-select {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color var(--transition);
+}
+.payment-draft-card .draft-select:focus {
+  border-color: var(--primary);
+}
+
+.overpayment-warning-msg {
+  animation: fadeUp 0.2s ease both;
+}
+

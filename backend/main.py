@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.db.database import init_db, AsyncSessionLocal
 from backend.routers.auth_router import router as auth_router
 from backend.routers.chat_router import router as chat_router
-from backend.services.zoho_service import list_all_invoices, list_recurring_invoices, get_invoice_stats
+from backend.services.zoho_service import list_all_invoices, list_recurring_invoices, get_invoice_stats, send_invoice_email, send_estimate_email
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +25,18 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 async def lifespan(app: FastAPI):
     logger.info("Starting up — initialising database…")
     await init_db()
+    
+    # Run additive migrations on invoice_cache
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("ALTER TABLE invoice_cache ADD COLUMN IF NOT EXISTS invoice_date DATE;"))
+            await session.execute(text("ALTER TABLE invoice_cache ADD COLUMN IF NOT EXISTS last_payment_date DATE;"))
+            await session.commit()
+        logger.info("Additive database migrations applied successfully.")
+    except Exception as e:
+        logger.error(f"Failed to apply database migrations: {e}")
+        
     logger.info("Ready.")
     yield
     logger.info("Shutting down.")
@@ -90,3 +102,36 @@ async def api_stats():
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+
+@app.post("/api/invoices/send")
+async def api_send_invoice(body: dict):
+    """Send an existing invoice to the client via Zoho email API."""
+    invoice_id = (body.get("invoice_id") or "").strip()
+    to_email   = (body.get("to_email")   or "").strip() or None
+    if not invoice_id:
+        return JSONResponse({"error": "invoice_id is required"}, status_code=400)
+    async with AsyncSessionLocal() as db:
+        try:
+            ok, reason = await send_invoice_email(invoice_id, db, to_email=to_email)
+            if ok:
+                return JSONResponse({"success": True})
+            return JSONResponse({"error": reason or "Failed to send invoice"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/estimates/send")
+async def api_send_estimate(body: dict):
+    """Send an existing estimate to the client via Zoho email API."""
+    estimate_id = (body.get("estimate_id") or "").strip()
+    to_email   = (body.get("to_email")   or "").strip() or None
+    if not estimate_id:
+        return JSONResponse({"error": "estimate_id is required"}, status_code=400)
+    async with AsyncSessionLocal() as db:
+        try:
+            ok, reason = await send_estimate_email(estimate_id, db, to_email=to_email)
+            if ok:
+                return JSONResponse({"success": True})
+            return JSONResponse({"error": reason or "Failed to send estimate"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)

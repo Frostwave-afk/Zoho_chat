@@ -39,6 +39,27 @@ class ManualInvoiceApproveRequest(BaseModel):
     line_items:   Optional[List["ManualInvoiceLineItem"]] = None
 
 
+class EstimateApproveRequest(BaseModel):
+    draft_id: str
+    send_email: bool = False
+    # Optional overrides from the editable card
+    client_name:  Optional[str] = None
+    client_email: Optional[str] = None
+    line_items:   Optional[List["EstimateLineItem"]] = None
+
+
+class MultiEstimateActionRequest(BaseModel):
+    estimate_ids: List[str]
+    mode: str  # "accept" | "reject" | "convert"
+
+
+class PaymentApproveRequest(BaseModel):
+    draft_id: str
+    amount: Optional[float] = None
+    payment_mode: Optional[str] = None
+    payment_date: Optional[str] = None
+
+
 # ── Internal data shapes ─────────────────────────────────────────────────────
 
 class InvoiceData(BaseModel):
@@ -93,6 +114,23 @@ class ManualInvoiceDraft(BaseModel):
     zoho_contact_id: Optional[str] = None
     is_new_contact: bool = False
     line_items: List[ManualInvoiceLineItem]
+    estimate_id: Optional[str] = None
+
+
+class EstimateLineItem(BaseModel):
+    item_name: str
+    description: str
+    amount: float
+
+
+class EstimateDraft(BaseModel):
+    draft_id: str
+    client_name: str
+    client_email: Optional[str] = None
+    currency: str = "INR"
+    zoho_contact_id: Optional[str] = None
+    is_new_contact: bool = False
+    line_items: List[EstimateLineItem]
 
 
 class ManualInvoiceConversation(BaseModel):
@@ -106,7 +144,9 @@ class ManualInvoiceConversation(BaseModel):
     line_items: List[ManualInvoiceLineItem] = []
     pending_item_name: Optional[str] = None
     pending_item_description: Optional[str] = None
+    pending_item_amount: Optional[float] = None
     send_email: Optional[bool] = None
+    is_estimate: bool = False
 
 
 class CreatedInvoice(BaseModel):
@@ -132,16 +172,51 @@ class PaymentInvoice(BaseModel):
     status: str
     due_date: Optional[str] = None
     balance: float
+    total: Optional[float] = None
     currency_code: str = "INR"
     zoho_view_url: Optional[str] = None
     days_overdue: Optional[int] = None
+    last_reminded_at: Optional[int] = None   # epoch seconds; None = never reminded
 
 
-# ── Outbound ─────────────────────────────────────────────────────────────────
+class PaymentRecordDraft(BaseModel):
+    draft_id: str
+    invoice_id: str
+    customer_id: str
+    customer_name: str
+    invoice_number: str
+    amount: float
+    payment_mode: str = "banktransfer"  # banktransfer, cash, check, creditcard, bankremittance, others
+    payment_date: str                   # YYYY-MM-DD
+    currency: str = "INR"
+
+
+class CreatedEstimate(BaseModel):
+    zoho_estimate_id: str
+    estimate_number: str
+    client_name: str
+    client_email: Optional[str] = None
+    amount: float
+    currency: str
+    estimate_url: Optional[str] = None
+    email_sent: bool = False
+    status: str = "sent"
+
+
+class AmbiguousEstimate(BaseModel):
+    estimate_id: str
+    estimate_number: str
+    customer_name: str
+    status: str
+    amount: float
+    currency: str = "INR"
+    date: Optional[str] = None
+    estimate_url: Optional[str] = None
+
 
 class ChatResponse(BaseModel):
     reply: str
-    action: str  # invoice_created | draft_pending | batch_pending | manual_invoice_pending | payment_status | clarification_needed | emails_scanned | error
+    action: str  # invoice_created | draft_pending | batch_pending | manual_invoice_pending | payment_status | clarification_needed | emails_scanned | error | payment_record_pending | payment_recorded | estimate_pending | estimate_created | estimate_converted
     drafts: Optional[List[DraftInvoice]] = None
     batch_draft: Optional[BatchDraft] = None
     manual_invoice_draft: Optional[ManualInvoiceDraft] = None
@@ -149,6 +224,12 @@ class ChatResponse(BaseModel):
     invoices_created: Optional[List[CreatedInvoice]] = None
     payment_invoices: Optional[List[PaymentInvoice]] = None
     ambiguous_contacts: Optional[List[AmbiguousContact]] = None
+    payment_record_draft: Optional[PaymentRecordDraft] = None
+    ambiguous_invoices: Optional[List[PaymentInvoice]] = None
+    estimate_draft: Optional[EstimateDraft] = None
+    estimates_created: Optional[List[CreatedEstimate]] = None
+    ambiguous_estimates: Optional[List[AmbiguousEstimate]] = None
+    disambiguation_mode: Optional[str] = None  # "accept" | "reject" | "convert" — tells UI which action the disambig is for
 
 
 

@@ -20,6 +20,11 @@ ZOHO_SCOPES = ",".join([
     "ZohoInvoice.contacts.READ",
     "ZohoInvoice.contacts.CREATE",
     "ZohoInvoice.settings.READ",
+    "ZohoInvoice.customerpayments.CREATE",
+    "ZohoInvoice.customerpayments.READ",
+    "ZohoInvoice.estimates.CREATE",
+    "ZohoInvoice.estimates.READ",
+    "ZohoInvoice.estimates.UPDATE",
 ])
 
 
